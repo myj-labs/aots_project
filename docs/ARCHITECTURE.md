@@ -19,6 +19,12 @@ For this starter, long-option P&L is `(mark_or_exit_price - entry_price) * quant
 
 SQLite stores trades, events and circuit-breaker state. The active session date is persisted in `app_state`; when the Asia/Kolkata calendar date changes, the consecutive-loss count and daily pause reset while the kill switch, trade ledger and event history are preserved. This is calendar-date rollover, not an exchange holiday or trading-session calendar. A process restart does not restore a strategy because no strategy runs by default.
 
+Paper entry requests require an idempotency key and a finite market-data-age value. SQLite serializes session rollover, risk validation, duplicate-key lookup, trade creation and the opening event. Mark and close transitions condition on the trade still being open, and their ledger, risk-state and audit-event writes commit as one transaction. A persistence exception rolls back the state transition; the API does not return a completed trade.
+
+Each mark/close transaction reads the latest committed trade row after acquiring SQLite's write lock, then computes and records the transition before committing. Concurrent marks are serialized in database-lock acquisition order; since the API has no market-data timestamp or sequence number, that ordering is not a claim that one mark is fresher than another.
+
+Market-data age is supplied by the caller and is not independently verified: there is no connected feed or source timestamp in the current architecture. Trading costs are not represented in the trade schema and are not deducted from P&L.
+
 ## API security
 
 The starter is intended for local development. It does not include user authentication, CSRF protection, role-based access, or hardened internet-facing deployment. Do not expose the dashboard to the public internet. Bind to localhost for local use or add an authenticated, network-restricted deployment front end before remote access.

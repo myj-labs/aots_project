@@ -1,5 +1,7 @@
 const $ = (id) => document.getElementById(id);
 const inr = (n) => new Intl.NumberFormat("en-IN",{style:"currency",currency:"INR",maximumFractionDigits:2}).format(Number(n||0));
+let pendingEntryKey = null;
+let entryRequestActive = false;
 async function api(path, options={}) {
   const res = await fetch(path,{headers:{"Content-Type":"application/json"},...options});
   const body = await res.json().catch(()=>({detail:"Unexpected response"}));
@@ -45,11 +47,18 @@ $("kill-toggle").addEventListener("click",async()=>{
   catch(e){alert(e.message);}
 });
 $("trade-form").addEventListener("submit",async(e)=>{
-  e.preventDefault(); const f=new FormData(e.currentTarget); const data=Object.fromEntries(f.entries());
+  e.preventDefault(); if(entryRequestActive)return;
+  const form=e.currentTarget; const button=form.querySelector('button[type="submit"]');
+  const f=new FormData(form); const data=Object.fromEntries(f.entries());
   ["entry_price","stop_price","quantity","lots","market_data_age_seconds"].forEach(k=>data[k]=Number(data[k]));
-  try { await api("/api/paper/trade",{method:"POST",body:JSON.stringify(data)}); $("form-message").textContent="Simulated trade created."; $("form-message").className="positive"; await refresh(); }
+  pendingEntryKey ||= crypto.randomUUID();
+  data.idempotency_key=pendingEntryKey;
+  entryRequestActive=true; button.disabled=true;
+  try { await api("/api/paper/trade",{method:"POST",body:JSON.stringify(data)}); pendingEntryKey=null; $("form-message").textContent="Simulated trade created."; $("form-message").className="positive"; await refresh(); }
   catch(err){$("form-message").textContent=err.message;$("form-message").className="negative";}
+  finally {entryRequestActive=false;button.disabled=false;}
 });
+$("trade-form").addEventListener("input",()=>{if(!entryRequestActive)pendingEntryKey=null;});
 $("trades-body").addEventListener("click",async(e)=>{
   const b=e.target.closest("button"); if(!b)return;
   try{

@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from .config import get_settings
-from .database import Database
+from .database import Database, IdempotencyConflict
 from .models import PaperTradeRequest, MarkPriceRequest, KillSwitchRequest
 from .paper import PaperBroker
 from .risk import RiskEngine, RiskRejected
@@ -95,6 +95,8 @@ def open_paper_trade(req: PaperTradeRequest):
         return paper.open_trade(req).model_dump(mode="json")
     except RiskRejected as exc:
         db.event("ENTRY_REJECTED", {"reason": str(exc), "symbol": req.symbol})
+        raise HTTPException(status_code=409, detail=str(exc))
+    except IdempotencyConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))

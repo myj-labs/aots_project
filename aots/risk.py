@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from math import isfinite
 from typing import Callable
 
 KOLKATA = timezone(timedelta(hours=5, minutes=30), "Asia/Kolkata")
@@ -42,10 +43,13 @@ class RiskEngine:
         return now.astimezone(timezone.utc)
 
     def _ensure_session(self, at: datetime | None = None) -> date:
-        session_time = self.current_time() if at is None else self._as_utc(at)
-        session_date = session_time.astimezone(KOLKATA).date()
+        session_date = self.trading_date(at)
         self.db.ensure_session(session_date)
         return session_date
+
+    def trading_date(self, at: datetime | None = None) -> date:
+        session_time = self.current_time() if at is None else self._as_utc(at)
+        return session_time.astimezone(KOLKATA).date()
 
     def set_kill_switch(self, enabled: bool):
         self._ensure_session()
@@ -64,14 +68,27 @@ class RiskEngine:
         self._ensure_session()
         return bool(self.db.get_state("paused_for_day", False))
 
-    def record_closed_trade(self, pnl: float, *, closed_at: datetime | None = None):
-        session_date = self._ensure_session()
+    def record_closed_trade(
+        self, pnl: float, *, closed_at: datetime | None = None, conn=None
+    ):
+        session_date = (
+            self.trading_date(closed_at)
+            if conn is not None
+            else self._ensure_session(closed_at)
+        )
+        if conn is not None:
+            self.db.ensure_session(session_date, conn=conn)
+            active_date = self.db.get_state("session_date", conn=conn)
+            if active_date != session_date.isoformat():
+                raise RiskRejected(
+                    "Session date is stale; trade close is not recorded."
+                )
         if closed_at is not None:
             close_date = self._as_utc(closed_at).astimezone(KOLKATA).date()
             if close_date != session_date:
                 return
         self.db.update_loss_streak(
-            session_date, pnl, self.settings.max_consecutive_losses
+            session_date, pnl, self.settings.max_consecutive_losses, conn=conn
         )
 
     def pnl(self):
@@ -101,9 +118,14 @@ class RiskEngine:
         self._ensure_session()
         return sum(1 for t in self.db.trades() if t["status"] == "OPEN")
 
-    def snapshot(self) -> RiskSnapshot:
-        session_date = self._ensure_session()
-        trades = self.db.trades()
+    def snapshot(self, *, _conn=None, _session_date: date | None = None) -> RiskSnapshot:
+        if _conn is None:
+            session_date = self._ensure_session()
+        else:
+            session_date = _session_date
+            if session_date is None:
+                session_date = self.current_time().astimezone(KOLKATA).date()
+        trades = self.db.trades(conn=_conn)
         realised, unrealised, daily = self._pnl_for_session(session_date, trades)
         return RiskSnapshot(
             capital_inr=self.settings.capital_inr,
@@ -112,21 +134,55 @@ class RiskEngine:
             realised_pnl=round(realised, 2),
             unrealised_pnl=round(unrealised, 2),
             daily_pnl=round(daily, 2),
-            consecutive_losses=int(self.db.get_state("consecutive_losses", 0)),
-            paused_for_day=bool(self.db.get_state("paused_for_day", False)),
-            kill_switch=bool(self.db.get_state("kill_switch", False)),
+            consecutive_losses=int(self.db.get_state("consecutive_losses", 0, conn=_conn)),
+            paused_for_day=bool(self.db.get_state("paused_for_day", False, conn=_conn)),
+            kill_switch=bool(self.db.get_state("kill_switch", False, conn=_conn)),
             open_positions=sum(1 for t in trades if t["status"] == "OPEN"),
         )
 
-    def validate_entry(self, *, entry_price, stop_price, quantity, lots, market_data_age_seconds):
-        snap = self.snapshot()
+    def validate_entry(
+        self,
+        *,
+        entry_price,
+        stop_price,
+        quantity,
+        lots,
+        market_data_age_seconds,
+        _conn=None,
+        _session_date: date | None = None,
+    ):
+        values = (entry_price, stop_price, quantity, lots, market_data_age_seconds)
+        if any(not isfinite(float(value)) for value in values):
+            raise RiskRejected("Entry values and market data age must be finite.")
+        if quantity <= 0 or lots <= 0 or market_data_age_seconds < 0:
+            raise RiskRejected("Quantity, lots and market data age must be valid.")
+        if entry_price <= 0 or stop_price <= 0:
+            raise RiskRejected("Entry and stop prices must be greater than zero.")
+        session_date = _session_date
+        if _conn is not None:
+            if session_date is None:
+                session_date = self.current_time().astimezone(KOLKATA).date()
+            active_date = self.db.get_state("session_date", conn=_conn)
+            if active_date != session_date.isoformat():
+                raise RiskRejected("Session date is stale; entry is blocked.")
+            snap = self.snapshot(_conn=_conn, _session_date=session_date)
+        else:
+            session_date = self._ensure_session()
+            active_date = self.db.get_state("session_date")
+            if active_date != session_date.isoformat():
+                raise RiskRejected("Session date is stale; entry is blocked.")
+            snap = self.snapshot()
         if snap.kill_switch:
             raise RiskRejected("Kill switch is active; entries are blocked.")
         if snap.paused_for_day:
             raise RiskRejected("Strategy is paused for the day after consecutive losses.")
         if snap.daily_pnl <= -snap.max_daily_loss_inr:
-            self.db.set_state("paused_for_day", True)
-            self.db.event("DAILY_LOSS_LIMIT_BREACHED", {"daily_pnl": snap.daily_pnl})
+            self.db.set_state("paused_for_day", True, conn=_conn)
+            self.db.event(
+                "DAILY_LOSS_LIMIT_BREACHED",
+                {"daily_pnl": snap.daily_pnl},
+                conn=_conn,
+            )
             raise RiskRejected("Daily loss limit breached; entries are blocked.")
         if snap.open_positions >= self.settings.max_open_positions:
             raise RiskRejected("Maximum open positions reached.")
