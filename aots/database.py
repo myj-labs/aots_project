@@ -261,10 +261,18 @@ class Database:
                 WHERE trade_id=:trade_id
             """, trade)
 
-    def transition_open_trade(self, trade: dict, after_transition):
-        """Atomically update one open trade and run associated state/event writes."""
+    def transition_open_trade(self, trade_id: str, prepare_transition, after_transition):
+        """Read, prepare, persist, and audit one open-trade transition atomically."""
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM trades WHERE trade_id=?", (trade_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError("Trade not found.")
+            if row["status"] != "OPEN":
+                return None
+            trade = prepare_transition(dict(row))
             cursor = conn.execute(
                 """
                 UPDATE trades SET mark_price=:mark_price,status=:status,
@@ -275,9 +283,9 @@ class Database:
                 trade,
             )
             if cursor.rowcount != 1:
-                return False
-            after_transition(conn)
-            return True
+                return None
+            after_transition(conn, trade)
+            return trade
 
     def trades(self, conn=None):
         if conn is not None:

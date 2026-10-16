@@ -21,6 +21,8 @@ SQLite stores trades, events and circuit-breaker state. The active session date 
 
 Paper entry requests require an idempotency key and a finite market-data-age value. SQLite serializes session rollover, risk validation, duplicate-key lookup, trade creation and the opening event. Mark and close transitions condition on the trade still being open, and their ledger, risk-state and audit-event writes commit as one transaction. A persistence exception rolls back the state transition; the API does not return a completed trade.
 
+Each mark/close transaction reads the latest committed trade row after acquiring SQLite's write lock, then computes and records the transition before committing. Concurrent marks are serialized in database-lock acquisition order; since the API has no market-data timestamp or sequence number, that ordering is not a claim that one mark is fresher than another.
+
 Market-data age is supplied by the caller and is not independently verified: there is no connected feed or source timestamp in the current architecture. Trading costs are not represented in the trade schema and are not deducted from P&L.
 
 ## API security

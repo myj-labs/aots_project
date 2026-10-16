@@ -52,20 +52,22 @@ class PaperBroker:
     def mark(self, trade_id: str, mark_price: float):
         if not isfinite(mark_price) or mark_price <= 0:
             raise ValueError("Mark price must be finite and greater than zero.")
-        trade = self._get_trade(trade_id)
-        if trade["status"] != "OPEN":
-            raise ValueError("Trade is not open.")
-        pnl = (mark_price - float(trade["entry_price"])) * int(trade["quantity"])
-        trade["mark_price"] = mark_price
-        triggered = mark_price <= float(trade["stop_price"])
-        if triggered:
-            self._prepare_close(trade, mark_price)
-            reason = "SIMULATED_STOP"
-        else:
-            trade["unrealised_pnl"] = round(pnl, 2)
-            reason = None
 
-        def after_transition(conn):
+        def prepare_transition(trade):
+            pnl = (mark_price - float(trade["entry_price"])) * int(trade["quantity"])
+            trade["mark_price"] = mark_price
+            if mark_price <= float(trade["stop_price"]):
+                self._prepare_close(trade, mark_price)
+            else:
+                trade["unrealised_pnl"] = round(pnl, 2)
+            return trade
+
+        def after_transition(conn, trade):
+            triggered = trade["status"] == "CLOSED"
+            pnl = round(
+                (mark_price - float(trade["entry_price"])) * int(trade["quantity"]),
+                2,
+            )
             self.db.event(
                 "PAPER_TRADE_MARKED",
                 {
@@ -76,27 +78,31 @@ class PaperBroker:
                 conn=conn,
             )
             if triggered:
-                self._record_close(conn, trade, reason)
+                self._record_close(conn, trade, "SIMULATED_STOP")
 
-        if not self.db.transition_open_trade(trade, after_transition):
+        trade = self.db.transition_open_trade(
+            trade_id, prepare_transition, after_transition
+        )
+        if trade is None:
             raise ValueError("Trade is not open.")
-        return self._as_model(self._get_trade(trade_id))
+        return self._as_model(trade)
 
     def close_trade(self, trade_id: str, exit_price: float, reason: str = "MANUAL"):
         if not isfinite(exit_price) or exit_price <= 0:
             raise ValueError("Exit price must be finite and greater than zero.")
-        trade = self._get_trade(trade_id)
-        if trade["status"] != "OPEN":
-            raise ValueError("Trade is not open.")
+        def prepare_transition(trade):
+            self._prepare_close(trade, exit_price)
+            return trade
 
-        self._prepare_close(trade, exit_price)
-
-        def after_transition(conn):
+        def after_transition(conn, trade):
             self._record_close(conn, trade, reason)
 
-        if not self.db.transition_open_trade(trade, after_transition):
+        trade = self.db.transition_open_trade(
+            trade_id, prepare_transition, after_transition
+        )
+        if trade is None:
             raise ValueError("Trade is not open.")
-        return self._as_model(self._get_trade(trade_id))
+        return self._as_model(trade)
 
     def _prepare_close(self, trade, exit_price: float):
         pnl = round(
