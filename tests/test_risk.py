@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 import pytest
 from aots.database import Database
@@ -125,3 +125,49 @@ def test_session_rollover_resets_scoped_state_but_preserves_kill_switch_and_hist
     assert restarted_risk.get_kill_switch()
     assert len(db.trades()) == trade_count
     assert len(db.events(limit=100)) == event_count
+
+
+def test_legacy_state_is_preserved_when_initializing_session_date(tmp_path):
+    settings = SimpleNamespace(
+        capital_inr=100_000, max_daily_loss_pct=.02, max_trade_risk_pct=.005,
+        max_consecutive_losses=3, max_open_positions=3, max_lots_per_order=1,
+        market_data_max_age_seconds=5,
+    )
+    db = Database(str(tmp_path / "legacy.db"))
+    db.set_state("consecutive_losses", 2)
+    db.set_state("paused_for_day", True)
+
+    risk = RiskEngine(
+        settings, db,
+        clock=lambda: datetime(2025, 1, 3, 6, 30, tzinfo=timezone.utc),
+    )
+
+    assert db.get_state("session_date") == "2025-01-03"
+    assert risk.get_consecutive_losses() == 2
+    assert risk.paused_for_day()
+
+
+def test_stale_close_and_backward_session_date_do_not_reset_active_streak(tmp_path):
+    _, db, risk = setup_risk(
+        tmp_path,
+        now=datetime(2025, 1, 4, 6, 30, tzinfo=timezone.utc),
+    )
+    risk.record_closed_trade(-10)
+    risk.record_closed_trade(-10)
+
+    risk.record_closed_trade(
+        -10, closed_at=datetime(2025, 1, 3, 17, 59, tzinfo=timezone.utc)
+    )
+    db.ensure_session(date(2025, 1, 3))
+
+    assert db.get_state("session_date") == "2025-01-04"
+    assert risk.get_consecutive_losses() == 2
+    assert not risk.paused_for_day()
+
+
+def test_loss_streak_update_requires_matching_active_session(tmp_path):
+    _, db, _ = setup_risk(tmp_path)
+
+    assert not db.update_loss_streak(date(2025, 1, 2), -10, 3)
+    assert db.get_state("consecutive_losses") == 0
+    assert not db.events()

@@ -65,13 +65,14 @@ class RiskEngine:
         return bool(self.db.get_state("paused_for_day", False))
 
     def record_closed_trade(self, pnl: float, *, closed_at: datetime | None = None):
-        self._ensure_session(closed_at)
-        streak = int(self.db.get_state("consecutive_losses", 0))
-        streak = streak + 1 if pnl < 0 else 0 if pnl > 0 else streak
-        self.db.set_state("consecutive_losses", streak)
-        if streak >= self.settings.max_consecutive_losses:
-            self.db.set_state("paused_for_day", True)
-            self.db.event("LOSS_STREAK_PAUSE", {"consecutive_losses": streak})
+        session_date = self._ensure_session()
+        if closed_at is not None:
+            close_date = self._as_utc(closed_at).astimezone(KOLKATA).date()
+            if close_date != session_date:
+                return
+        self.db.update_loss_streak(
+            session_date, pnl, self.settings.max_consecutive_losses
+        )
 
     def pnl(self):
         session_date = self._ensure_session()

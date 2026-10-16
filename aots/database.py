@@ -69,22 +69,72 @@ class Database:
         """Persist the active calendar date and reset only date-scoped risk state."""
         value = session_date.isoformat()
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT value FROM app_state WHERE key='session_date'"
             ).fetchone()
-            if row and json.loads(row["value"]) == value:
+            if row:
+                current_value = json.loads(row["value"])
+                if current_value >= value:
+                    return False
+                conn.executemany(
+                    """
+                    INSERT INTO app_state(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                    """,
+                    (
+                        ("session_date", json.dumps(value)),
+                        ("consecutive_losses", json.dumps(0)),
+                        ("paused_for_day", json.dumps(False)),
+                    ),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO app_state(key, value) VALUES ('session_date', ?)",
+                    (json.dumps(value),),
+                )
+                conn.executemany(
+                    "INSERT OR IGNORE INTO app_state(key, value) VALUES (?, ?)",
+                    (
+                        ("consecutive_losses", json.dumps(0)),
+                        ("paused_for_day", json.dumps(False)),
+                    ),
+                )
+            return True
+
+    def update_loss_streak(self, session_date: date, pnl: float, limit: int) -> bool:
+        """Update the loss streak only if the requested date is still active."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM app_state WHERE key='session_date'"
+            ).fetchone()
+            if not row or json.loads(row["value"]) != session_date.isoformat():
                 return False
-            conn.executemany(
+            row = conn.execute(
+                "SELECT value FROM app_state WHERE key='consecutive_losses'"
+            ).fetchone()
+            streak = int(json.loads(row["value"])) if row else 0
+            streak = streak + 1 if pnl < 0 else 0 if pnl > 0 else streak
+            conn.execute(
                 """
-                INSERT INTO app_state(key, value) VALUES (?, ?)
+                INSERT INTO app_state(key, value) VALUES ('consecutive_losses', ?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value
                 """,
-                (
-                    ("session_date", json.dumps(value)),
-                    ("consecutive_losses", json.dumps(0)),
-                    ("paused_for_day", json.dumps(False)),
-                ),
+                (json.dumps(streak),),
             )
+            if streak >= limit:
+                conn.execute(
+                    """
+                    INSERT INTO app_state(key, value) VALUES ('paused_for_day', ?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                    """,
+                    (json.dumps(True),),
+                )
+                conn.execute(
+                    "INSERT INTO events(event_type, detail_json) VALUES (?, ?)",
+                    ("LOSS_STREAK_PAUSE", json.dumps({"consecutive_losses": streak})),
+                )
             return True
 
     def insert_trade(self, trade: dict):
