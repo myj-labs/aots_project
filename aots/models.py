@@ -9,13 +9,22 @@ def utc_now() -> datetime:
 
 class PaperTradeRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=80)
-    idempotency_key: str = Field(min_length=1, max_length=128)
+    idempotency_key: str = Field(max_length=128)
     side: Literal["BUY"] = "BUY"
     entry_price: float = Field(gt=0)
     stop_price: float = Field(gt=0)
     quantity: int = Field(gt=0)
     lots: int = Field(default=1, ge=1)
     market_data_age_seconds: float = Field(ge=0, allow_inf_nan=False)
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("idempotency_key must not be empty or whitespace-only.")
+        if value != value.strip():
+            raise ValueError("idempotency_key must not have surrounding whitespace.")
+        return value
 
     @field_validator("stop_price")
     @classmethod

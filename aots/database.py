@@ -200,6 +200,14 @@ class Database:
         idempotency_key: str,
         rejection_type: type[Exception],
     ) -> dict:
+        if not idempotency_key.strip():
+            raise ValueError(
+                "idempotency_key must not be empty or whitespace-only."
+            )
+        if idempotency_key != idempotency_key.strip():
+            raise ValueError(
+                "idempotency_key must not have surrounding whitespace."
+            )
         rejection = None
         created = False
         with self.connect() as conn:

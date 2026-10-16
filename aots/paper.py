@@ -71,7 +71,7 @@ class PaperBroker:
                 {
                     "trade_id": trade_id,
                     "mark_price": mark_price,
-                    "unrealised_pnl": round(pnl, 2),
+                    "unrealised_pnl": 0 if triggered else round(pnl, 2),
                 },
                 conn=conn,
             )

@@ -1,5 +1,6 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+import json
 import sqlite3
 from threading import Barrier
 from types import SimpleNamespace
@@ -59,6 +60,29 @@ def test_paper_trade_open_mark_close_lifecycle_uses_long_option_pnl(tmp_path):
     ]
 
 
+def test_stop_trigger_mark_event_matches_persisted_closed_trade(tmp_path):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(paper_request())
+
+    closed = broker.mark(opened.trade_id, 90)
+
+    persisted = next(t for t in db.trades() if t["trade_id"] == opened.trade_id)
+    events = list(reversed(db.events()))
+    marked_event = next(e for e in events if e["event_type"] == "PAPER_TRADE_MARKED")
+    closed_event = next(e for e in events if e["event_type"] == "PAPER_TRADE_CLOSED")
+    marked_detail = json.loads(marked_event["detail_json"])
+    closed_detail = json.loads(closed_event["detail_json"])
+
+    assert closed.status == "CLOSED"
+    assert persisted["status"] == "CLOSED"
+    assert persisted["unrealised_pnl"] == 0
+    assert persisted["realised_pnl"] == -100
+    assert marked_detail["unrealised_pnl"] == 0
+    assert closed_detail["pnl"] == -100
+    assert closed_detail["reason"] == "SIMULATED_STOP"
+
+
 def test_closed_trade_breaching_current_session_limit_pauses_entries(tmp_path):
     settings = SimpleNamespace(
         capital_inr=100_000, max_daily_loss_pct=.02, max_trade_risk_pct=.005,
@@ -107,6 +131,21 @@ def test_duplicate_entry_replays_original_trade_without_second_position(tmp_path
     assert [event["event_type"] for event in reversed(db.events())] == [
         "PAPER_TRADE_OPENED",
     ]
+
+
+def test_duplicate_entry_replay_after_close_returns_original_without_duplicate_event(tmp_path):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    request = paper_request(key="closed-replay")
+    opened = broker.open_trade(request)
+    closed = broker.close_trade(opened.trade_id, exit_price=110)
+
+    replay = broker.open_trade(request)
+
+    assert replay.trade_id == closed.trade_id == opened.trade_id
+    assert replay.status == "CLOSED"
+    assert len(db.trades()) == 1
+    assert sum(e["event_type"] == "PAPER_TRADE_OPENED" for e in db.events()) == 1
 
 
 def test_reusing_idempotency_key_for_different_order_is_rejected(tmp_path):
@@ -221,6 +260,29 @@ def test_market_age_is_required_finite_and_positive(tmp_path):
         make_paper_services(tmp_path)[2].validate_entry(
             entry_price=100, stop_price=95, quantity=1, lots=1,
             market_data_age_seconds=float("nan"),
+        )
+
+
+def test_idempotency_key_rejects_whitespace_only_and_surrounding_whitespace(tmp_path):
+    with pytest.raises(ValueError, match="whitespace-only"):
+        paper_request(key="")
+    with pytest.raises(ValueError, match="whitespace-only"):
+        paper_request(key="   ")
+    with pytest.raises(ValueError, match="surrounding whitespace"):
+        paper_request(key=" key ")
+
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    with pytest.raises(ValueError, match="surrounding whitespace"):
+        broker.open_trade(paper_request(key=" key "))
+    assert not db.trades()
+    with pytest.raises(ValueError, match="whitespace-only"):
+        db.insert_trade_atomically(
+            {},
+            session_date=date(2025, 1, 3),
+            validate=lambda _conn: 0,
+            idempotency_key=" ",
+            rejection_type=RiskRejected,
         )
 
 

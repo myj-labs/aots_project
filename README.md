@@ -78,7 +78,7 @@ curl -X POST http://127.0.0.1:8000/api/paper/trade \
 ```
 
 This example uses an illustrative quantity only. Use current exchange contract specifications and lot sizes when building a real instrument master. It does not select a real contract or generate a signal.
-Paper-entry requests require a unique `idempotency_key` and an explicit finite `market_data_age_seconds`. Reuse the same key when retrying an order; different order terms with a reused key are rejected. The reported age is caller-supplied because this application has no connected market-data feed.
+Paper-entry requests require a unique `idempotency_key` and an explicit finite `market_data_age_seconds`. Empty keys and keys with surrounding whitespace are rejected (keys are not trimmed). Reuse the same key when retrying an order; different order terms with a reused key are rejected. The reported age is caller-supplied because this application has no connected market-data feed.
 
 ## Risk model notes
 
