@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,28 @@ class Database:
                 "INSERT INTO app_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, json.dumps(value)),
             )
+
+    def ensure_session(self, session_date: date) -> bool:
+        """Persist the active calendar date and reset only date-scoped risk state."""
+        value = session_date.isoformat()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM app_state WHERE key='session_date'"
+            ).fetchone()
+            if row and json.loads(row["value"]) == value:
+                return False
+            conn.executemany(
+                """
+                INSERT INTO app_state(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (
+                    ("session_date", json.dumps(value)),
+                    ("consecutive_losses", json.dumps(0)),
+                    ("paused_for_day", json.dumps(False)),
+                ),
+            )
+            return True
 
     def insert_trade(self, trade: dict):
         with self.connect() as conn:

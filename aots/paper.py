@@ -1,4 +1,3 @@
-from datetime import datetime, timezone
 from uuid import uuid4
 from .models import PaperTrade
 from .risk import RiskEngine
@@ -18,7 +17,7 @@ class PaperBroker:
             lots=req.lots,
             market_data_age_seconds=req.market_data_age_seconds,
         )
-        now = datetime.now(timezone.utc)
+        now = self.risk.current_time()
         trade = PaperTrade(
             trade_id=str(uuid4()),
             symbol=req.symbol,
@@ -58,13 +57,14 @@ class PaperBroker:
         if trade["status"] != "OPEN":
             raise ValueError("Trade is not open.")
         pnl = round((exit_price - float(trade["entry_price"])) * int(trade["quantity"]), 2)
+        closed_at = self.risk.current_time()
         trade["mark_price"] = exit_price
         trade["status"] = "CLOSED"
         trade["realised_pnl"] = pnl
         trade["unrealised_pnl"] = 0
-        trade["closed_at"] = datetime.now(timezone.utc).isoformat()
+        trade["closed_at"] = closed_at.isoformat()
         self.db.update_trade(trade)
-        self.risk.record_closed_trade(pnl)
+        self.risk.record_closed_trade(pnl, closed_at=closed_at)
         self.db.event("PAPER_TRADE_CLOSED", {"trade_id": trade_id, "exit_price": exit_price, "pnl": pnl, "reason": reason})
         # Re-check portfolio loss after realised P&L; pause entries if limit breached.
         snap = self.risk.snapshot()

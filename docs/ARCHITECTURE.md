@@ -13,11 +13,11 @@
 
 ## P&L semantics
 
-For this starter, long-option P&L is `(mark_or_exit_price - entry_price) * quantity`. Fees, taxes, slippage, contract multiplier semantics and fill-level accounting are not yet modeled. This is sufficient only for exercising the app workflow and risk gate.
+For this starter, long-option P&L is `(mark_or_exit_price - entry_price) * quantity`. Daily realised P&L includes only trades whose `closed_at` date, converted to Asia/Kolkata, matches the current calendar date. Unrealised P&L from all currently open paper positions is included. Fees, taxes, slippage, contract multiplier semantics and fill-level accounting are not yet modeled.
 
 ## State and restart behavior
 
-SQLite stores trades and circuit-breaker state. The consecutive-loss count and paused-for-day flag currently persist until manually reset in the database; daily session rollover/reset is not automated. That is intentionally conservative but needs a market-calendar-aware session manager before serious testing. A process restart does not restore a strategy because no strategy runs by default.
+SQLite stores trades, events and circuit-breaker state. The active session date is persisted in `app_state`; when the Asia/Kolkata calendar date changes, the consecutive-loss count and daily pause reset while the kill switch, trade ledger and event history are preserved. This is calendar-date rollover, not an exchange holiday or trading-session calendar. A process restart does not restore a strategy because no strategy runs by default.
 
 ## API security
 
