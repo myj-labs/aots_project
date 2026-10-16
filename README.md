@@ -13,6 +13,7 @@ A runnable starter for a NIFTY-options trading system with a FastAPI web dashboa
 - Max open positions, max lots per order, stale-market-data guard
 - Kill switch blocks new entries
 - SQLite event/trade persistence
+- Asia/Kolkata calendar-date risk rollover (not an exchange holiday calendar)
 - Pluggable strategy protocol; no trading strategy is enabled by default
 - Groww API boundary documented separately; no live order methods implemented
 - Automated tests
@@ -78,7 +79,8 @@ This example uses an illustrative quantity only. Use current exchange contract s
 
 ## Risk model notes
 
-- The daily-loss limit is calculated against the configured starting capital and realised + unrealised P&L tracked by this local paper ledger.
+- The daily-loss limit is calculated against the configured starting capital and current-date realised + open-position unrealised P&L tracked by this local paper ledger. Trade closing dates use Asia/Kolkata.
+- Consecutive losses and the daily pause reset on Asia/Kolkata calendar-date changes. This is not an exchange holiday or trading-session calendar; the kill switch and trade/event history persist across rollover.
 - Risk per trade is calculated as `(entry - stop) * quantity` for BUY positions. This starter is long-option oriented and rejects short trades; expand the model carefully before supporting multi-leg or short-option strategies.
 - An entry is rejected if stop risk exceeds the configured per-trade allowance, lot count exceeds the limit, the kill switch is on, market data is stale, daily loss is breached, the loss streak is paused, or position count is at its limit.
 - Risk limits do not guarantee a maximum loss in real markets. Gaps, slippage, liquidity, rejected exits and outages can exceed stop estimates.
