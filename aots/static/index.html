@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AOTS · Paper Trading</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div>
+    <p class="eyebrow">AUTOMATED OPTIONS TRADING SYSTEM</p>
+    <h1>AOTS <span class="pill">PAPER MODE</span></h1>
+    <p class="muted">NIFTY · Groww integration boundary · Live orders disabled</p>
+  </div>
+  <div class="header-actions">
+    <span class="status-dot"></span><span id="health-label">Checking system…</span>
+    <button id="refresh">Refresh</button>
+  </div>
+</header>
+<main>
+  <section class="warning">
+    <strong>Paper trading only.</strong> Simulated orders never reach Groww. The local kill switch blocks new paper entries; it does not cancel broker orders or square off a real account.
+  </section>
+  <section class="cards">
+    <article class="metric"><span>Illustrative capital</span><strong id="capital">₹100,000</strong><small>Configured starting capital</small></article>
+    <article class="metric"><span>Paper P&amp;L</span><strong id="pnl">₹0.00</strong><small>Realised + unrealised</small></article>
+    <article class="metric"><span>Open positions</span><strong id="positions-count">0</strong><small>Simulated positions only</small></article>
+    <article class="metric"><span>Max daily loss</span><strong id="loss-limit">₹2,000</strong><small>Entry gate threshold</small></article>
+  </section>
+  <section class="grid">
+    <article class="panel">
+      <div class="panel-heading"><div><h2>Risk controls</h2><p class="muted">Risk engine gates every simulated entry.</p></div><span id="risk-badge" class="pill">Loading</span></div>
+      <div class="risk-list">
+        <div><span>Per-trade risk</span><strong id="trade-risk">0.5% · ₹500</strong></div>
+        <div><span>Consecutive losses</span><strong id="loss-streak">0 / 3</strong></div>
+        <div><span>Daily P&amp;L</span><strong id="daily-pnl">₹0.00</strong></div>
+        <div><span>Entry kill switch</span><strong id="kill-status">OFF</strong></div>
+      </div>
+      <button class="danger" id="kill-toggle">Enable kill switch</button>
+    </article>
+    <article class="panel">
+      <div class="panel-heading"><div><h2>Simulate a paper trade</h2><p class="muted">No real order placement or market data connection.</p></div></div>
+      <form id="trade-form">
+        <label>Option symbol<input name="symbol" value="NIFTY-DEMO-CE" required maxlength="80"></label>
+        <div class="form-row">
+          <label>Entry price (₹)<input name="entry_price" type="number" min="0.05" step="0.05" value="100" required></label>
+          <label>Stop price (₹)<input name="stop_price" type="number" min="0.05" step="0.05" value="95" required></label>
+        </div>
+        <div class="form-row">
+          <label>Quantity<input name="quantity" type="number" min="1" step="1" value="25" required></label>
+          <label>Lots<input name="lots" type="number" min="1" max="10" step="1" value="1" required></label>
+        </div>
+        <label>Market data age (seconds)<input name="market_data_age_seconds" type="number" min="0" step="0.1" value="0" required></label>
+        <button type="submit">Create simulated trade</button>
+        <p id="form-message" role="status" class="muted"></p>
+      </form>
+    </article>
+  </section>
+  <section class="panel">
+    <div class="panel-heading"><div><h2>Paper positions &amp; trade ledger</h2><p class="muted">Update marks or close trades to exercise risk controls.</p></div></div>
+    <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Status</th><th>Qty</th><th>Entry</th><th>Mark / Exit</th><th>P&amp;L</th><th>Actions</th></tr></thead><tbody id="trades-body"><tr><td colspan="7">Loading trades…</td></tr></tbody></table></div>
+  </section>
+  <section class="panel">
+    <div class="panel-heading"><div><h2>System boundary</h2><p class="muted">The current app is deliberately not connected to a broker.</p></div></div>
+    <div class="boundary">
+      <div><span class="boundary-icon">01</span><strong>Strategy</strong><p>Pluggable interface; safe no-op default.</p></div>
+      <div><span class="boundary-icon">02</span><strong>Risk engine</strong><p>Validates size, stop risk, stale data and circuit breakers.</p></div>
+      <div><span class="boundary-icon">03</span><strong>Paper broker</strong><p>Simulates fills and stores the ledger locally.</p></div>
+      <div><span class="boundary-icon">04</span><strong>Groww adapter</strong><p>Read-only integration boundary; no order method.</p></div>
+    </div>
+  </section>
+  <footer>Prototype for engineering validation, not investment advice. Verify official SEBI, exchange and broker requirements before live deployment.</footer>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
