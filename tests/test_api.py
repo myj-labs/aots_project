@@ -1,5 +1,9 @@
+import html
 import json
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -637,6 +641,179 @@ def test_dashboard_serves_trade_controls_and_sequence_aware_script(paper_api):
     assert 't.close_reason==="SIMULATED_TAKE_PROFIT"' in script.text
     assert 'const target = data.take_profit_profit_inr.trim();' in script.text
     assert 'api("/api/paper/mark"' in script.text
+
+
+def test_core_endpoints_stay_healthy_when_strategy_history_fails(paper_api, monkeypatch):
+    client, _, db, _ = paper_api
+    assert client.post("/api/paper/trade", json=trade_payload("partial-refresh")).status_code == 200
+
+    def broken_history():
+        raise RuntimeError("history unavailable")
+
+    monkeypatch.setattr(db, "strategy_decisions", broken_history)
+
+    assert client.get("/api/strategy/decisions").status_code == 500
+    assert client.get("/api/status").status_code == 200
+    risk = client.get("/api/risk")
+    assert risk.status_code == 200
+    assert risk.json()["open_positions"] == 1
+    trades = client.get("/api/trades")
+    assert trades.status_code == 200
+    assert [(t["symbol"], t["status"]) for t in trades.json()] == [("NIFTY-DEMO-CE", "OPEN")]
+
+
+def _find_headless_browser():
+    for name in ("msedge", "chrome", "chromium", "chromium-browser", "google-chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for path in (
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ):
+        if Path(path).exists():
+            return path
+    return None
+
+
+_BROWSER = _find_headless_browser()
+_STATIC_DIR = Path(api.__file__).parent / "static"
+
+
+def run_dashboard_refresh(tmp_path, steps, app_js=None):
+    """Run the real index.html/app.js in a headless browser with a stubbed fetch.
+
+    Each step maps an API path to (status, JSON body). The dashboard is refreshed once per
+    step and a snapshot of the rendered sections is returned for each.
+    """
+    script_path = Path(app_js) if app_js else _STATIC_DIR / "app.js"
+    html_text = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    harness = f"""<script>
+const STEPS = {json.dumps(steps)};
+let current = 0;
+window.fetch = async (path) => {{
+  const route = STEPS[current][path];
+  if (!route) throw new TypeError("no stub for " + path);
+  return {{ok: route[0] < 400, status: route[0], json: async () => route[1]}};
+}};
+</script>
+<script src="{script_path.as_uri()}"></script>
+<script>
+(async () => {{
+  const ids = ["health-label","capital","pnl","positions-count","risk-badge","trades-body","strategy-decisions"];
+  const out = [];
+  for (let i = 0; i < STEPS.length; i++) {{
+    current = i;
+    await new Promise(r => setTimeout(r, 50));
+    await refresh();
+    out.push(Object.fromEntries(ids.map(id => [id, {{text: document.getElementById(id).innerText,
+      html: document.getElementById(id).innerHTML}}])));
+  }}
+  const pre = document.createElement("pre");
+  pre.id = "snapshot";
+  pre.textContent = JSON.stringify(out);
+  document.body.appendChild(pre);
+}})();
+</script>"""
+    page = html_text.replace('<script src="/static/app.js"></script>', harness)
+    assert harness in page
+    page_path = tmp_path / "dashboard-harness.html"
+    page_path.write_text(page, encoding="utf-8")
+    result = subprocess.run(
+        [_BROWSER, "--headless=new", "--disable-gpu", "--no-first-run", "--dump-dom",
+         "--virtual-time-budget=10000", f"--user-data-dir={tmp_path / 'browser-profile'}",
+         page_path.as_uri()],
+        capture_output=True, text=True, encoding="utf-8", timeout=60, check=False,
+    )
+    match = re.search(r'<pre id="snapshot">(.*?)</pre>', result.stdout, re.S)
+    assert match, f"dashboard harness produced no snapshot: {result.stderr[-500:]}"
+    return json.loads(html.unescape(match.group(1)))
+
+
+def dashboard_steps(client, **overrides):
+    """Real API payloads (open trade seeded by the caller) plus per-step failure overrides."""
+    routes = {
+        path: (200, client.get(path).json())
+        for path in ("/api/status", "/api/risk", "/api/trades")
+    }
+    routes["/api/strategy/decisions"] = (200, [])
+    routes.update(overrides)
+    return routes
+
+
+needs_browser = pytest.mark.skipif(_BROWSER is None, reason="no headless Chrome/Edge available")
+
+
+@needs_browser
+def test_dashboard_renders_core_sections_when_strategy_history_returns_503(paper_api, tmp_path):
+    client, _, _, _ = paper_api
+    assert client.post("/api/paper/trade", json=trade_payload("browser-open")).status_code == 200
+    healthy = dashboard_steps(client)
+    failed_history = dashboard_steps(
+        client,
+        **{"/api/strategy/decisions": (503, {"detail": "history <b>down</b>"})},
+    )
+
+    normal, partial = run_dashboard_refresh(tmp_path, [healthy, failed_history])
+
+    for snapshot in (normal, partial):
+        assert snapshot["health-label"]["text"] == "System healthy · paper only"
+        assert "API unavailable" not in snapshot["health-label"]["text"]
+        assert "₹1,00,000" in snapshot["capital"]["text"]
+        assert snapshot["positions-count"]["text"] == "1"
+        assert snapshot["risk-badge"]["text"] == "Active"
+        assert "NIFTY-DEMO-CE" in snapshot["trades-body"]["text"]
+        assert "OPEN" in snapshot["trades-body"]["text"]
+        assert "Loading trades" not in snapshot["trades-body"]["text"]
+    assert "No processed observations yet" in normal["strategy-decisions"]["text"]
+    history = partial["strategy-decisions"]
+    assert "Strategy history unavailable: history <b>down</b>" in history["text"]
+    assert "Loading decisions" not in history["text"]
+    # The error message is escaped, not injected as markup.
+    assert "<b>" not in history["html"]
+    assert "&lt;b&gt;down&lt;/b&gt;" in history["html"]
+
+
+@needs_browser
+@pytest.mark.parametrize("failing_path", ["/api/status", "/api/risk", "/api/trades"])
+def test_dashboard_reports_core_request_failure_without_claiming_fresh_data(
+    paper_api, tmp_path, failing_path
+):
+    client, _, _, _ = paper_api
+    assert client.post("/api/paper/trade", json=trade_payload("browser-core")).status_code == 200
+    healthy = dashboard_steps(client)
+    failed_core = dashboard_steps(
+        client, **{failing_path: (503, {"detail": "core <i>down</i>"})}
+    )
+
+    before, after = run_dashboard_refresh(tmp_path, [healthy, failed_core])
+
+    assert before["health-label"]["text"] == "System healthy · paper only"
+    assert after["health-label"]["text"] == "API unavailable: core <i>down</i>"
+    assert "System healthy" not in after["health-label"]["text"]
+    assert after["risk-badge"]["text"] == "Data unavailable"
+    trades = after["trades-body"]["text"]
+    assert "Trades unavailable" in trades and "out of date" in trades
+    assert "NIFTY-DEMO-CE" not in trades
+    assert "Loading trades" not in trades
+    # The optional history section is independent and still renders.
+    assert "No processed observations yet" in after["strategy-decisions"]["text"]
+    assert "<i>" not in after["health-label"]["html"]
+
+
+@needs_browser
+def test_dashboard_formats_validation_error_details_instead_of_object_object(paper_api, tmp_path):
+    client, _, _, _ = paper_api
+    detail = [{"loc": ["body", "spot"], "msg": "Input should be greater than 0", "type": "x"}]
+    steps = [dashboard_steps(client, **{"/api/status": (422, {"detail": detail})})]
+
+    (snapshot,) = run_dashboard_refresh(tmp_path, steps)
+
+    label = snapshot["health-label"]["text"]
+    assert label == "API unavailable: spot: Input should be greater than 0"
+    assert "[object Object]" not in label
 
 
 def teardown_module():
