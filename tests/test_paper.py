@@ -129,6 +129,65 @@ def test_take_profit_closes_at_accepted_observed_mark(
         assert risk.snapshot().unrealised_pnl == 0
 
 
+def test_ten_lots_of_65_units_use_total_quantity_once_for_profit(tmp_path):
+    settings, db, risk = make_paper_services(
+        tmp_path,
+        capital_inr=1_000_000,
+        max_trade_risk_pct=.01,
+        max_lots_per_order=10,
+    )
+    broker = PaperBroker(settings, db, risk)
+    lots, lot_size = 10, 65
+    opened = broker.open_trade(
+        paper_request(
+            quantity=lots * lot_size,
+            lots=lots,
+            stop_price=99,
+            take_profit_profit_inr=1500,
+        )
+    )
+
+    closed = broker.mark(opened.trade_id, 102.31, observation_sequence=1)
+
+    assert closed.quantity == 650
+    assert closed.lots == 10
+    assert closed.status == "CLOSED"
+    assert closed.realised_pnl == 1501.5
+    assert closed.close_reason == "SIMULATED_TAKE_PROFIT"
+    close_event = next(
+        e for e in reversed(db.events()) if e["event_type"] == "PAPER_TRADE_CLOSED"
+    )
+    assert json.loads(close_event["detail_json"])["pnl"] == 1501.5
+
+
+@pytest.mark.parametrize(
+    ("symbol", "quantity", "lots", "expected_pnl"),
+    [
+        ("NIFTY-CALL-CE", 65, 1, 195),
+        ("NIFTY-PUT-PE", 130, 2, 390),
+    ],
+)
+def test_long_call_and_put_pnl_scales_with_total_quantity(
+    tmp_path, symbol, quantity, lots, expected_pnl
+):
+    settings, db, risk = make_paper_services(tmp_path, max_lots_per_order=3)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(
+        paper_request(
+            key=f"{symbol}-{quantity}",
+            symbol=symbol,
+            quantity=quantity,
+            lots=lots,
+            stop_price=99.9,
+        )
+    )
+
+    marked = broker.mark(opened.trade_id, 103, observation_sequence=1)
+
+    assert marked.status == "OPEN"
+    assert marked.unrealised_pnl == expected_pnl
+
+
 @pytest.mark.parametrize("target", [0, -1, float("inf"), float("nan")])
 def test_take_profit_target_must_be_finite_and_positive(tmp_path, target):
     with pytest.raises(ValueError):
@@ -183,7 +242,7 @@ def test_stop_has_priority_for_corrupt_overlapping_exit_thresholds(tmp_path):
     opened = broker.open_trade(paper_request(take_profit_profit_inr=100))
     with db.connect() as conn:
         conn.execute(
-            "UPDATE trades SET take_profit_profit_inr=1 WHERE trade_id=?",
+            "UPDATE trades SET take_profit_profit_inr=-100 WHERE trade_id=?",
             (opened.trade_id,),
         )
 
@@ -196,6 +255,39 @@ def test_stop_has_priority_for_corrupt_overlapping_exit_thresholds(tmp_path):
     assert closed.close_reason == "SIMULATED_STOP"
     assert closed.mark_price == 94.5
     assert json.loads(close_event["detail_json"])["reason"] == "SIMULATED_STOP"
+
+
+@pytest.mark.parametrize("failed_event", ["PAPER_TRADE_MARKED", "PAPER_TRADE_CLOSED"])
+def test_take_profit_audit_failure_rolls_back_complete_transition(
+    tmp_path, monkeypatch, failed_event
+):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(
+        paper_request(quantity=65, stop_price=99.9, take_profit_profit_inr=650)
+    )
+    before_events = db.events()
+    original_event = db.event
+
+    def fail_target_event(event_type, detail, conn=None):
+        if event_type == failed_event:
+            raise OSError("simulated take-profit event persistence failure")
+        return original_event(event_type, detail, conn=conn)
+
+    monkeypatch.setattr(db, "event", fail_target_event)
+    with pytest.raises(OSError, match="take-profit event persistence failure"):
+        broker.mark(opened.trade_id, 110, observation_sequence=1)
+
+    persisted = db.trades()[0]
+    assert persisted["status"] == "OPEN"
+    assert persisted["mark_price"] == 100
+    assert persisted["mark_sequence"] == 0
+    assert persisted["realised_pnl"] == 0
+    assert persisted["unrealised_pnl"] == 0
+    assert persisted["close_reason"] is None
+    assert risk.snapshot().daily_pnl == 0
+    assert risk.get_consecutive_losses() == 0
+    assert db.events() == before_events
 
 
 def test_concurrent_take_profit_marks_close_once(tmp_path):
@@ -721,7 +813,9 @@ def test_database_migration_preserves_legacy_trade_rows(tmp_path):
     assert db.trades()[0]["close_reason"] is None
 
 
-def test_database_migration_converts_legacy_premium_target_to_total_profit(tmp_path):
+def test_database_migration_preserves_legacy_premium_target_without_reinterpreting_it(
+    tmp_path,
+):
     path = str(tmp_path / "legacy-target.db")
     with sqlite3.connect(path) as conn:
         conn.executescript("""
@@ -747,7 +841,7 @@ def test_database_migration_converts_legacy_premium_target_to_total_profit(tmp_p
 
     assert migrated["trade_id"] == "legacy-target"
     assert migrated["take_profit_price"] == 650
-    assert migrated["take_profit_profit_inr"] == 650
+    assert migrated["take_profit_profit_inr"] is None
 
 
 def test_daily_pause_event_failure_rolls_back_close_and_pause(tmp_path, monkeypatch):

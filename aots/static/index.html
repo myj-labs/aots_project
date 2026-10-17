@@ -47,9 +47,9 @@
           <label>Entry price (₹)<input name="entry_price" type="number" min="0.05" step="0.05" value="100" required></label>
           <label>Stop price (₹)<input name="stop_price" type="number" min="0.05" step="0.05" value="95" required></label>
         </div>
-        <label>Take-profit profit target (₹ total, optional)<input name="take_profit_profit_inr" type="number" min="0.01" step="0.01" placeholder="e.g. 650"><small>Automatically exit when the calculated total trade profit reaches or exceeds this amount.</small></label>
+        <label>Total trade profit target (₹)<input name="take_profit_profit_inr" type="number" min="0.01" step="0.01" placeholder="Optional, e.g. 1,500"><small>Automatically exit when total position profit reaches or exceeds this amount.</small></label>
         <div class="form-row">
-          <label>Quantity<input name="quantity" type="number" min="1" step="1" value="65" required></label>
+          <label>Total quantity (all lots)<input name="quantity" type="number" min="1" step="1" value="65" required><small>Enter total option units across lots; quantity is not multiplied by lots again.</small></label>
           <label>Lots<input name="lots" type="number" min="1" max="10" step="1" value="1" required></label>
         </div>
         <label>Market data age (seconds)<input name="market_data_age_seconds" type="number" min="0" step="0.1" value="0" required></label>

@@ -413,15 +413,51 @@ def test_api_take_profit_persists_and_closes_with_observed_mark(paper_api, monke
     assert close_events[0]["detail"]["reason"] == "SIMULATED_TAKE_PROFIT"
 
 
+def test_api_invalid_mark_sequences_cannot_trigger_take_profit(paper_api):
+    client, _, db, _ = paper_api
+    created = client.post(
+        "/api/paper/trade",
+        json={
+            **trade_payload("invalid-sequence-target"),
+            "take_profit_profit_inr": 50,
+        },
+    )
+    trade_id = created.json()["trade_id"]
+    accepted = client.post(
+        "/api/paper/mark",
+        json={
+            "trade_id": trade_id,
+            "mark_price": 101,
+            "observation_sequence": 2,
+        },
+    )
+    assert accepted.status_code == 200
+    before_trade = db.trades()[0]
+    before_risk = client.get("/api/risk").json()
+    before_events = decoded_events(client)
+
+    invalid_sequences = (None, 0, 2.5, True)
+    for sequence in invalid_sequences:
+        payload = {"trade_id": trade_id, "mark_price": 110}
+        if sequence is not None:
+            payload["observation_sequence"] = sequence
+        response = client.post("/api/paper/mark", json=payload)
+        assert response.status_code == 422
+        assert db.trades()[0] == before_trade
+        assert client.get("/api/risk").json() == before_risk
+        assert decoded_events(client) == before_events
+
+
 @pytest.mark.parametrize("failed_event", ["PAPER_TRADE_MARKED", "PAPER_TRADE_CLOSED"])
-def test_api_stop_mark_persistence_failure_rolls_back_everything(
+def test_api_take_profit_persistence_failure_rolls_back_everything(
     paper_api, monkeypatch, failed_event
 ):
     client, _, db, risk = paper_api
     created = client.post(
         "/api/paper/trade",
         json={
-            **trade_payload("rollback"),
+            **trade_payload("take-profit-rollback"),
+            "quantity": 65,
             "take_profit_profit_inr": 650,
         },
     )
@@ -440,7 +476,7 @@ def test_api_stop_mark_persistence_failure_rolls_back_everything(
         "/api/paper/mark",
         json={
             "trade_id": trade_id,
-            "mark_price": 90,
+            "mark_price": 110,
             "observation_sequence": 1,
         },
     )
@@ -469,6 +505,7 @@ def test_dashboard_serves_trade_controls_and_sequence_aware_script(paper_api):
     assert 'data-sequence="${t.mark_sequence+1}"' in script.text
     assert 'observation_sequence:Number(b.dataset.sequence)' in script.text
     assert 'name="take_profit_profit_inr"' in page.text
+    assert "Total quantity (all lots)" in page.text
     assert 't.close_reason==="SIMULATED_TAKE_PROFIT"' in script.text
     assert 'const target = data.take_profit_profit_inr.trim();' in script.text
     assert 'api("/api/paper/mark"' in script.text

@@ -72,14 +72,6 @@ class Database:
                 conn.execute(
                     "ALTER TABLE trades ADD COLUMN take_profit_profit_inr REAL"
                 )
-                if "take_profit_price" in columns:
-                    conn.execute(
-                        """
-                        UPDATE trades
-                        SET take_profit_profit_inr = take_profit_price
-                        WHERE take_profit_price IS NOT NULL
-                        """
-                    )
             if "close_reason" not in columns:
                 conn.execute("ALTER TABLE trades ADD COLUMN close_reason TEXT")
 

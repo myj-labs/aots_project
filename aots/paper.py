@@ -67,10 +67,8 @@ class PaperBroker:
                 raise ValueError(
                     "Mark observation is stale or duplicate; sequence must be greater than the last accepted sequence."
                 )
-            pnl = round(
-                (mark_price - float(trade["entry_price"]))
-                * int(trade["quantity"]),
-                2,
+            pnl = self._calculate_pnl(
+                trade["entry_price"], mark_price, trade["quantity"]
             )
             trade["mark_price"] = mark_price
             trade["mark_sequence"] = observation_sequence
@@ -88,17 +86,13 @@ class PaperBroker:
 
         def after_transition(conn, trade):
             triggered = trade["status"] == "CLOSED"
-            pnl = round(
-                (mark_price - float(trade["entry_price"])) * int(trade["quantity"]),
-                2,
-            )
             self.db.event(
                 "PAPER_TRADE_MARKED",
                 {
                     "trade_id": trade_id,
                     "mark_price": mark_price,
                     "observation_sequence": observation_sequence,
-                    "unrealised_pnl": 0 if triggered else round(pnl, 2),
+                    "unrealised_pnl": 0 if triggered else trade["unrealised_pnl"],
                     "close_reason": trade["close_reason"],
                 },
                 conn=conn,
@@ -131,9 +125,8 @@ class PaperBroker:
         return self._as_model(trade)
 
     def _prepare_close(self, trade, exit_price: float, reason: str):
-        pnl = round(
-            (exit_price - float(trade["entry_price"])) * int(trade["quantity"]),
-            2,
+        pnl = self._calculate_pnl(
+            trade["entry_price"], exit_price, trade["quantity"]
         )
         closed_at = self.risk.current_time()
         trade["mark_price"] = exit_price
@@ -142,6 +135,10 @@ class PaperBroker:
         trade["unrealised_pnl"] = 0
         trade["close_reason"] = reason
         trade["closed_at"] = closed_at.isoformat()
+
+    @staticmethod
+    def _calculate_pnl(entry_price: float, exit_price: float, quantity: int) -> float:
+        return round((exit_price - float(entry_price)) * int(quantity), 2)
 
     def _record_close(self, conn, trade, reason):
         pnl = float(trade["realised_pnl"])
