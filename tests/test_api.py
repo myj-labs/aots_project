@@ -639,6 +639,47 @@ def test_dashboard_serves_trade_controls_and_sequence_aware_script(paper_api):
     assert 'api("/api/paper/mark"' in script.text
 
 
+def test_core_endpoints_stay_healthy_when_strategy_history_fails(paper_api, monkeypatch):
+    client, _, db, _ = paper_api
+    assert client.post("/api/paper/trade", json=trade_payload("partial-refresh")).status_code == 200
+
+    def broken_history():
+        raise RuntimeError("history unavailable")
+
+    monkeypatch.setattr(db, "strategy_decisions", broken_history)
+
+    assert client.get("/api/strategy/decisions").status_code == 500
+    assert client.get("/api/status").status_code == 200
+    risk = client.get("/api/risk")
+    assert risk.status_code == 200
+    assert risk.json()["open_positions"] == 1
+    trades = client.get("/api/trades")
+    assert trades.status_code == 200
+    assert [(t["symbol"], t["status"]) for t in trades.json()] == [("NIFTY-DEMO-CE", "OPEN")]
+
+
+def test_dashboard_refresh_isolates_strategy_history_failure(paper_api):
+    # No browser framework is installed, so this checks the served script's structure.
+    client, _, _, _ = paper_api
+    script = client.get("/static/app.js").text
+    start = script.index("async function refresh()")
+    refresh = script[start:script.index("function renderStrategyDecisions")]
+    core, history = refresh.split("const decisions = await decisionsResult;")
+
+    # Core requests no longer include the optional history request.
+    assert 'Promise.all([api("/api/status"),api("/api/risk"),api("/api/trades")])' in refresh
+    assert refresh.count('"/api/strategy/decisions"') == 1
+    assert 'api("/api/strategy/decisions")' not in core.split("try {")[1]
+    # Core failure keeps the global error and marks trades unavailable.
+    assert "API unavailable:" in core
+    assert "Trades unavailable" in core
+    # History failure is reported in the strategy section only.
+    assert "API unavailable" not in history
+    assert "Strategy history unavailable:" in history
+    assert 'escapeHtml(decisions.error.message)' in history
+    assert 'renderStrategyDecisions(decisions.value)' in history
+
+
 def teardown_module():
     if _original_database_path is None:
         os.environ.pop("AOTS_DATABASE_PATH", None)

@@ -9,8 +9,10 @@ async function api(path, options={}) {
   return body;
 }
 async function refresh() {
+  // Optional strategy history is fetched independently so its failure cannot block core sections.
+  const decisionsResult = api("/api/strategy/decisions").then(value => ({value}), error => ({error}));
   try {
-    const [status,risk,trades,decisions] = await Promise.all([api("/api/status"),api("/api/risk"),api("/api/trades"),api("/api/strategy/decisions")]);
+    const [status,risk,trades] = await Promise.all([api("/api/status"),api("/api/risk"),api("/api/trades")]);
     $("health-label").textContent = "System healthy · paper only";
     $("capital").textContent = inr(status.capital_inr);
     $("strategy-threshold").textContent = status.strategy_spot_threshold == null ?
@@ -34,8 +36,16 @@ async function refresh() {
     $("kill-toggle").textContent = risk.kill_switch ? "Disable kill switch" : "Enable kill switch";
     $("kill-toggle").className = risk.kill_switch ? "" : "danger";
     renderTrades(trades);
-    renderStrategyDecisions(decisions);
-  } catch(e) { $("health-label").textContent = `API unavailable: ${e.message}`; }
+  } catch(e) {
+    $("health-label").textContent = `API unavailable: ${e.message}`;
+    $("trades-body").innerHTML = '<tr><td colspan="15" class="negative">Trades unavailable: core data could not be refreshed. Displayed values may be out of date.</td></tr>';
+  }
+  const decisions = await decisionsResult;
+  if(decisions.error) {
+    $("strategy-decisions").innerHTML = `<tr><td colspan="5" class="negative">Strategy history unavailable: ${escapeHtml(decisions.error.message)}</td></tr>`;
+  } else {
+    renderStrategyDecisions(decisions.value);
+  }
 }
 function renderStrategyDecisions(decisions) {
   const body = $("strategy-decisions");
