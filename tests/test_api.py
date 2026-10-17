@@ -121,6 +121,7 @@ def paper_api(tmp_path, monkeypatch):
         max_open_positions=3,
         max_lots_per_order=1,
         market_data_max_age_seconds=5,
+        strategy_spot_threshold=25_000,
         database_path=str(tmp_path / "api-test.db"),
     )
     fixed_time = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
@@ -147,6 +148,23 @@ def trade_payload(key="api-trade"):
         "lots": 1,
         "market_data_age_seconds": 0,
     }
+
+
+def strategy_payload(observation_id="api-observation", **overrides):
+    payload = {
+        "observation_id": observation_id,
+        "underlying": "NIFTY",
+        "spot": 25_100,
+        "observed_at": "2025-01-03T04:00:00+00:00",
+        "symbol": "NIFTY-DEMO-CE",
+        "entry_price": 100,
+        "stop_price": 95,
+        "quantity": 10,
+        "lots": 1,
+        "take_profit_profit_inr": 100,
+    }
+    payload.update(overrides)
+    return payload
 
 
 def decoded_events(client):
@@ -262,6 +280,79 @@ def test_api_paper_lifecycle_observation_rejection_stop_and_closed_state(paper_a
     assert client.get("/api/trades").json() == closed_trade_before
     assert decoded_events(client) == events_before_closed_mark
     assert client.get("/api/risk").json() == risk_after_stop
+
+
+def test_strategy_api_evaluation_is_pure_and_process_is_idempotent(paper_api):
+    client, _, db, _ = paper_api
+    before_events = decoded_events(client)
+    evaluation = client.post(
+        "/api/strategy/evaluate", json=strategy_payload()
+    )
+    assert evaluation.status_code == 200
+    assert evaluation.json()["status"] == "SIGNAL"
+    assert db.trades() == []
+    assert db.strategy_decisions() == []
+    assert decoded_events(client) == before_events
+
+    processed = client.post(
+        "/api/strategy/process", json=strategy_payload()
+    )
+    assert processed.status_code == 200
+    result = processed.json()
+    assert result["status"] == "TRADE_CREATED"
+    assert result["resulting_trade_id"]
+    assert len(db.trades()) == 1
+    assert len(db.strategy_decisions()) == 1
+    assert db.trades()[0]["idempotency_key"].startswith("strategy:")
+    assert len(db.trades()[0]["idempotency_key"]) < 128
+
+    replay = client.post(
+        "/api/strategy/process", json=strategy_payload()
+    )
+    assert replay.status_code == 200
+    assert replay.json() == result
+    assert len(db.trades()) == 1
+    assert len(db.strategy_decisions()) == 1
+
+    conflict = client.post(
+        "/api/strategy/process",
+        json=strategy_payload(spot=25_200),
+    )
+    assert conflict.status_code == 409
+    assert "different inputs" in conflict.json()["detail"]
+    assert len(db.trades()) == 1
+    assert client.get("/api/strategy/decisions").json() == [result]
+
+
+def test_strategy_api_validation_risk_rejection_and_dashboard(paper_api):
+    client, _, db, _ = paper_api
+    invalid = client.post(
+        "/api/strategy/evaluate",
+        json=strategy_payload(observed_at="2025-01-03T04:00:00"),
+    )
+    assert invalid.status_code == 422
+    assert db.trades() == []
+
+    enabled = client.post("/api/risk/kill-switch", json={"enabled": True})
+    assert enabled.status_code == 200
+    blocked = client.post(
+        "/api/strategy/process", json=strategy_payload("blocked-by-kill")
+    )
+    assert blocked.status_code == 200
+    assert blocked.json()["status"] == "RISK_REJECTED"
+    assert "Kill switch" in blocked.json()["reason"]
+    assert db.trades() == []
+    assert client.get("/api/strategy/decisions").json() == [blocked.json()]
+
+    page = client.get("/")
+    script = client.get("/static/app.js")
+    assert "Deterministic strategy demonstration" in page.text
+    assert "Evaluate only" in page.text
+    assert "Process paper entry" in page.text
+    assert "Recent persisted strategy decisions" in page.text
+    assert "mark freshness" in page.text
+    assert "/api/strategy/evaluate" in script.text
+    assert "/api/strategy/process" in script.text
 
 
 @pytest.mark.parametrize(

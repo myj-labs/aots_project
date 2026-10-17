@@ -6,7 +6,8 @@
 - `aots.config`: validated environment configuration; paper-only guard
 - `aots.risk`: deterministic entry risk checks and circuit breakers
 - `aots.paper`: local simulated broker, P&L marks, simulated stop behavior
-- `aots.strategy`: pluggable protocol and safe no-op strategy
+- `aots.strategy`: pluggable protocol, safe no-op, and deterministic supplied-input threshold demonstration
+- `aots.strategy_service`: pure decision evaluation and explicit risk-gated paper processing
 - `aots.brokers.base`: read-only broker contract
 - `aots.brokers.groww`: placeholder read-only adapter boundary
 - `aots.database`: SQLite persistence for trades, app state and audit events
@@ -28,6 +29,12 @@ Mark requests require a positive, caller-supplied `observation_sequence` greater
 Paper entries can optionally persist `take_profit_profit_inr`, a positive target for total trade P&L in rupees. P&L uses `(mark - entry) * quantity`, with `quantity` representing total option units across all lots; `lots` is not multiplied a second time. This starter has no authoritative lot-size master, so callers supply the correct total quantity (for example, 10 lots × 65 units = quantity 650). On an accepted mark, P&L is calculated and rounded to paise; the existing stop condition (`mark_price <= stop_price`) is checked first, followed by closure when calculated profit reaches or exceeds the configured target. The trade closes at the observed mark price, records reason `SIMULATED_TAKE_PROFIT`, and writes trade/risk/audit changes in the same transaction. No fill at an implied threshold premium or intrabar price path is inferred. Trades without a target retain stop and manual-close behavior. Additive nullable `take_profit_profit_inr` and `close_reason` columns preserve legacy records. A legacy `take_profit_price` column is left intact and is not copied into `take_profit_profit_inr`, avoiding reinterpretation of premium values as total profit.
 
 Market-data age is supplied by the caller and is not independently verified: there is no connected feed or source timestamp in the current architecture. Trading costs are not represented in the trade schema and are not deducted from P&L.
+
+## Strategy demonstration
+
+`SpotThresholdStrategy` implements the existing `Strategy.evaluate(MarketSnapshot)` contract. Its sole rule is to signal when supplied spot is at or above configured `AOTS_STRATEGY_SPOT_THRESHOLD`. `StrategyService.evaluate` is side-effect free. The explicit process route persists a structured outcome, reuses `RiskEngine.validate_entry`, and conditionally creates a paper trade. Input observation timestamps must include a timezone and pass the configured maximum-age check; caller-supplied timestamps and prices remain unverified.
+
+The additive `strategy_decisions` table is keyed by `(strategy_id, observation_id)` and stores a canonical input/configuration fingerprint and the complete outcome. `BEGIN IMMEDIATE` serializes lookup, fingerprint comparison, risk validation, trade insertion, audit events and decision insertion. Identical retries return the original outcome; a changed payload for the same observation conflicts. These records are strategy-decision history only and do not duplicate trade or risk state.
 
 ## API security
 

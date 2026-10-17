@@ -14,7 +14,7 @@ A runnable starter for a NIFTY-options trading system with a FastAPI web dashboa
 - Kill switch blocks new entries
 - SQLite event/trade persistence
 - Asia/Kolkata calendar-date risk rollover (not an exchange holiday calendar)
-- Pluggable strategy protocol; no trading strategy is enabled by default
+- Pluggable strategy protocol plus an opt-in supplied-input spot-threshold demonstration
 - Groww API boundary documented separately; no live order methods implemented
 - Automated tests
 
@@ -58,7 +58,31 @@ The dashboard starts in paper mode with an empty ledger. Use the API docs at `/d
 - `POST /api/paper/trade` — create a simulated trade
 - `POST /api/paper/mark` — update simulated price/P&L
 - `POST /api/paper/close/{trade_id}` — close a simulated trade
+- `POST /api/strategy/evaluate` — evaluate supplied inputs without persisting or trading
+- `POST /api/strategy/process` — persist a decision and risk-gate an explicit simulated entry
+- `GET /api/strategy/decisions` — inspect recent persisted strategy outcomes
 - `GET /health` — health check
+
+### Deterministic strategy demonstration
+
+The optional `spot-threshold-demo` strategy evaluates one simple rule: **signal when the explicitly supplied underlying spot is greater than or equal to `AOTS_STRATEGY_SPOT_THRESHOLD`**. Set a positive threshold in `.env` or the process environment to enable it; if unset, evaluation fails closed as `REJECTED`. The demonstration accepts the configured underlying (default `NIFTY`) only.
+
+Every evaluation request must supply an observation ID, underlying, finite positive spot, timezone-aware observation timestamp, candidate symbol, entry premium, stop premium, total quantity, lots, and optional positive total-position profit target in INR. The candidate prices and contract symbol are caller-supplied; the rule does not select an option, infer call/put type, calculate prices, or verify the source. `observed_at` is compared to the local evaluation clock and rejected if it is in the future or older than `AOTS_MARKET_DATA_MAX_AGE_SECONDS`. This prevents accepting missing timestamps, but cannot establish that user-supplied timestamps or prices are authentic. No live feed, candles, indicators, or instrument master is present.
+
+Use `POST /api/strategy/evaluate` to get a structured `SIGNAL`, `NO_SIGNAL`, or `REJECTED` result. This endpoint is pure: it does not write decisions, trades, or audit events. Use `POST /api/strategy/process` only when you explicitly want to persist the result and attempt a paper entry. A qualifying candidate is sent through the existing authoritative risk validation; a risk failure is persisted as `RISK_REJECTED`, with no trade. A successful result is `TRADE_CREATED`; neither a signal nor a created simulated trade implies profitability. The existing BUY-only paper model, stop-first closure, mark sequencing, long-option P&L and total-INR take-profit behavior are unchanged.
+
+Each process request must use a stable `observation_id`. SQLite serializes the idempotency check, risk decision, optional trade insertion, decision record, and audit events in one `BEGIN IMMEDIATE` transaction. Retrying an identical strategy/version/observation/input/configuration returns the original persisted decision and trade ID. Reusing the same observation ID with different inputs or configuration returns HTTP 409 without overwriting it. A storage error rolls back the attempted decision, trade and transaction-scoped audit events. `GET /api/strategy/decisions` returns the most recent 50 processed outcomes; evaluation-only outcomes are intentionally not in that history.
+
+Set the strategy threshold locally, for example in PowerShell:
+
+```powershell
+$env:AOTS_STRATEGY_SPOT_THRESHOLD = "25000"
+.\.venv\Scripts\python.exe -m uvicorn aots.api:app --host 127.0.0.1 --port 8000
+```
+
+In the dashboard, enter a unique observation ID and all supplied inputs, including an ISO-8601 timestamp with timezone (for example `2026-10-18T00:10:00+05:30`). **Evaluate only** does not persist or open a trade. **Process paper entry** records the outcome and, if the configured spot rule signals and all risk checks pass, opens a local paper position. Use `/api/strategy/decisions` or the dashboard’s recent-decision list to inspect processed signals, no-signals, stale/unconfigured rejections, and risk rejections.
+
+This is a deterministic demonstration, not an autonomous trading strategy. It is paper-only, has no broker order placement or connected live market-data feed, and makes no claim of profitability. Do not treat manual or caller-supplied data as exchange-confirmed.
 
 ### Example simulated trade
 

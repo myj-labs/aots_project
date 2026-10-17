@@ -6,9 +6,15 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from .config import get_settings
 from .database import Database, IdempotencyConflict
-from .models import PaperTradeRequest, MarkPriceRequest, KillSwitchRequest
+from .models import (
+    PaperTradeRequest,
+    MarkPriceRequest,
+    KillSwitchRequest,
+    StrategyEvaluationRequest,
+)
 from .paper import PaperBroker
 from .risk import RiskEngine, RiskRejected
+from .strategy_service import StrategyService
 
 settings = get_settings()
 db = Database(settings.database_path)
@@ -49,6 +55,7 @@ def status():
         "underlying": settings.underlying,
         "live_trading_enabled": False,
         "capital_inr": settings.capital_inr,
+        "strategy_spot_threshold": settings.strategy_spot_threshold,
         "risk": snap.__dict__,
         "trade_count": len(db.trades()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -87,6 +94,28 @@ def positions():
 @app.get("/api/events")
 def events():
     return db.events(100)
+
+
+def _strategy_service():
+    return StrategyService(settings, db, risk, paper)
+
+
+@app.post("/api/strategy/evaluate")
+def evaluate_strategy(req: StrategyEvaluationRequest):
+    return _strategy_service().evaluate(req)
+
+
+@app.post("/api/strategy/process")
+def process_strategy(req: StrategyEvaluationRequest):
+    try:
+        return _strategy_service().process(req)
+    except IdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/api/strategy/decisions")
+def strategy_decisions():
+    return db.strategy_decisions()
 
 
 @app.post("/api/paper/trade")

@@ -13,21 +13,7 @@ class PaperBroker:
 
     def open_trade(self, req):
         now = self.risk.current_time()
-        trade = PaperTrade(
-            trade_id=str(uuid4()),
-            symbol=req.symbol,
-            side=req.side,
-            entry_price=req.entry_price,
-            stop_price=req.stop_price,
-            take_profit_profit_inr=req.take_profit_profit_inr,
-            mark_price=req.entry_price,
-            quantity=req.quantity,
-            lots=req.lots,
-            status="OPEN",
-            realised_pnl=0,
-            unrealised_pnl=0,
-            created_at=now,
-        )
+        trade = self._new_trade(req, now)
         trade_data = trade.model_dump(mode="json")
 
         def validate(conn):
@@ -49,6 +35,53 @@ class PaperBroker:
             rejection_type=RiskRejected,
         )
         return self._as_model(result)
+
+    def open_trade_in_transaction(self, req, *, conn, idempotency_key: str):
+        now = self.risk.current_time()
+        session_date = self.risk.trading_date(now)
+        self.db.ensure_session(session_date, conn=conn)
+        risk_inr = self.risk.validate_entry(
+            entry_price=req.entry_price,
+            stop_price=req.stop_price,
+            quantity=req.quantity,
+            lots=req.lots,
+            market_data_age_seconds=req.market_data_age_seconds,
+            _conn=conn,
+            _session_date=session_date,
+        )
+        trade = self._new_trade(req, now)
+        trade_data = trade.model_dump(mode="json")
+        self.db.insert_trade(
+            {**trade_data, "idempotency_key": idempotency_key},
+            conn=conn,
+        )
+        self.db.event(
+            "PAPER_TRADE_OPENED",
+            {
+                "trade_id": trade.trade_id,
+                "symbol": trade.symbol,
+                "estimated_risk_inr": risk_inr,
+            },
+            conn=conn,
+        )
+        return trade
+
+    def _new_trade(self, req, now):
+        return PaperTrade(
+            trade_id=str(uuid4()),
+            symbol=req.symbol,
+            side=req.side,
+            entry_price=req.entry_price,
+            stop_price=req.stop_price,
+            take_profit_profit_inr=req.take_profit_profit_inr,
+            mark_price=req.entry_price,
+            quantity=req.quantity,
+            lots=req.lots,
+            status="OPEN",
+            realised_pnl=0,
+            unrealised_pnl=0,
+            created_at=now,
+        )
 
     def mark(
         self, trade_id: str, mark_price: float, observation_sequence: int

@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     max_open_positions: int = Field(default=3, ge=1, le=20)
     max_lots_per_order: int = Field(default=1, ge=1, le=10)
     market_data_max_age_seconds: int = Field(default=5, ge=1, le=60)
+    strategy_spot_threshold: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False
+    )
     square_off_time: str = "15:15"
     database_path: str = "./data/aots.db"
     live_trading_enabled: bool = False
