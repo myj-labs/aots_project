@@ -38,6 +38,7 @@ async function refresh() {
     renderTrades(trades);
   } catch(e) {
     $("health-label").textContent = `API unavailable: ${e.message}`;
+    $("risk-badge").textContent = "Data unavailable";
     $("trades-body").innerHTML = '<tr><td colspan="15" class="negative">Trades unavailable: core data could not be refreshed. Displayed values may be out of date.</td></tr>';
   }
   const decisions = await decisionsResult;
