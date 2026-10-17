@@ -802,6 +802,12 @@ def test_database_migration_preserves_legacy_trade_rows(tmp_path):
     assert db.trades()[0]["trade_id"] == "legacy"
     with db.connect() as conn:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
     assert {
         "idempotency_key",
         "mark_sequence",
@@ -811,6 +817,7 @@ def test_database_migration_preserves_legacy_trade_rows(tmp_path):
     assert db.trades()[0]["mark_sequence"] == 0
     assert db.trades()[0]["take_profit_profit_inr"] is None
     assert db.trades()[0]["close_reason"] is None
+    assert "strategy_decisions" in tables
 
 
 def test_database_migration_preserves_legacy_premium_target_without_reinterpreting_it(

@@ -62,6 +62,43 @@
     </article>
   </section>
   <section class="panel">
+    <div class="panel-heading">
+      <div><h2>Deterministic strategy demonstration</h2>
+        <p class="muted">Supplied test inputs only; no live market feed. Evaluation is pure. Processing explicitly attempts a risk-gated paper entry.</p>
+        <p class="muted">Rule: signal when supplied spot is at/above configured threshold <strong id="strategy-threshold">Not configured</strong>.</p>
+      </div>
+    </div>
+    <form id="strategy-form">
+      <div class="form-row">
+        <label>Observation ID<input name="observation_id" required maxlength="128"></label>
+        <label>Underlying<input name="underlying" value="NIFTY" required maxlength="32"></label>
+      </div>
+      <div class="form-row">
+        <label>Supplied spot<input name="spot" type="number" min="0.01" step="any" required></label>
+        <label>Observed timestamp with timezone<input name="observed_at" type="text" placeholder="2026-10-17T18:30:00+00:00" required></label>
+      </div>
+      <div class="form-row">
+        <label>Candidate symbol<input name="symbol" value="NIFTY-DEMO-CE" required maxlength="80"></label>
+        <label>Candidate entry premium (₹)<input name="entry_price" type="number" min="0.01" step="any" required></label>
+      </div>
+      <div class="form-row">
+        <label>Candidate stop premium (₹)<input name="stop_price" type="number" min="0.01" step="any" required></label>
+        <label>Candidate total quantity<input name="quantity" type="number" min="1" step="1" required></label>
+      </div>
+      <div class="form-row">
+        <label>Lots<input name="lots" type="number" min="1" step="1" required></label>
+        <label>Total profit target (₹, optional)<input name="take_profit_profit_inr" type="number" min="0.01" step="0.01"></label>
+      </div>
+      <div class="form-row">
+        <button type="button" id="strategy-evaluate">Evaluate only</button>
+        <button type="button" id="strategy-process">Process paper entry</button>
+      </div>
+      <p id="strategy-message" role="status" class="muted"></p>
+    </form>
+    <h3>Recent persisted strategy decisions</h3>
+    <div class="table-wrap"><table><thead><tr><th>Evaluated (UTC)</th><th>Observation</th><th>Status</th><th>Reason</th><th>Candidate / trade</th></tr></thead><tbody id="strategy-decisions"><tr><td colspan="5">Loading decisions…</td></tr></tbody></table></div>
+  </section>
+  <section class="panel">
     <div class="panel-heading"><div><h2>Paper positions &amp; trade ledger</h2><p class="muted">Update marks or close trades to exercise risk controls.</p></div></div>
     <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Position side</th><th>Option type</th><th>Status</th><th>Entry premium</th><th>Stop premium</th><th>Total profit target (₹)</th><th>Last accepted manual mark / exit</th><th>Total quantity</th><th>Lots</th><th>P&amp;L type / amount</th><th>Entered (IST)</th><th>Closed (IST)</th><th>Closure reason</th><th>Actions</th></tr></thead><tbody id="trades-body"><tr><td colspan="15">Loading trades…</td></tr></tbody></table></div>
   </section>

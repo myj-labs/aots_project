@@ -10,9 +10,11 @@ async function api(path, options={}) {
 }
 async function refresh() {
   try {
-    const [status,risk,trades] = await Promise.all([api("/api/status"),api("/api/risk"),api("/api/trades")]);
+    const [status,risk,trades,decisions] = await Promise.all([api("/api/status"),api("/api/risk"),api("/api/trades"),api("/api/strategy/decisions")]);
     $("health-label").textContent = "System healthy · paper only";
     $("capital").textContent = inr(status.capital_inr);
+    $("strategy-threshold").textContent = status.strategy_spot_threshold == null ?
+      "Not configured" : `${Number(status.strategy_spot_threshold).toLocaleString("en-IN")} (${status.underlying})`;
     $("pnl").textContent = inr(risk.daily_pnl);
     $("pnl").className = risk.daily_pnl >= 0 ? "positive" : "negative";
     $("realised-pnl").textContent = inr(risk.realised_pnl);
@@ -32,7 +34,17 @@ async function refresh() {
     $("kill-toggle").textContent = risk.kill_switch ? "Disable kill switch" : "Enable kill switch";
     $("kill-toggle").className = risk.kill_switch ? "" : "danger";
     renderTrades(trades);
+    renderStrategyDecisions(decisions);
   } catch(e) { $("health-label").textContent = `API unavailable: ${e.message}`; }
+}
+function renderStrategyDecisions(decisions) {
+  const body = $("strategy-decisions");
+  if(!decisions.length){body.innerHTML='<tr><td colspan="5" class="muted">No processed observations yet. Evaluation-only results are not persisted.</td></tr>';return;}
+  body.innerHTML = decisions.map(d => {
+    const candidate = d.resulting_trade_id ? `Trade ${escapeHtml(d.resulting_trade_id)}` :
+      d.signal ? `${escapeHtml(d.signal.symbol)} · BUY` : "—";
+    return `<tr><td>${escapeHtml(d.evaluated_at)}</td><td>${escapeHtml(d.observation_id)}</td><td>${escapeHtml(d.status)}</td><td>${escapeHtml(d.reason)}</td><td>${candidate}</td></tr>`;
+  }).join("");
 }
 function renderTrades(trades) {
   const body = $("trades-body");
@@ -88,6 +100,31 @@ $("trade-form").addEventListener("submit",async(e)=>{
   finally {entryRequestActive=false;button.disabled=false;}
 });
 $("trade-form").addEventListener("input",()=>{if(!entryRequestActive)pendingEntryKey=null;});
+$("strategy-evaluate").addEventListener("click",()=>submitStrategy("/api/strategy/evaluate"));
+$("strategy-process").addEventListener("click",()=>submitStrategy("/api/strategy/process"));
+async function submitStrategy(path) {
+  const form = $("strategy-form");
+  const values = Object.fromEntries(new FormData(form).entries());
+  values.spot = Number(values.spot);
+  values.entry_price = Number(values.entry_price);
+  values.stop_price = Number(values.stop_price);
+  values.quantity = Number(values.quantity);
+  values.lots = Number(values.lots);
+  values.take_profit_profit_inr = values.take_profit_profit_inr.trim() ?
+    Number(values.take_profit_profit_inr) : null;
+  $("strategy-message").textContent = "Submitting supplied inputs…";
+  $("strategy-message").className = "muted";
+  try {
+    const decision = await api(path,{method:"POST",body:JSON.stringify(values)});
+    $("strategy-message").textContent = `${decision.status}: ${decision.reason}`;
+    $("strategy-message").className = decision.status==="TRADE_CREATED" ? "positive" :
+      decision.status==="SIGNAL" || decision.status==="NO_SIGNAL" ? "muted" : "negative";
+    if(path==="/api/strategy/process")await refresh();
+  } catch(err) {
+    $("strategy-message").textContent = err.message;
+    $("strategy-message").className = "negative";
+  }
+}
 $("trades-body").addEventListener("click",async(e)=>{
   const b=e.target.closest("button"); if(!b)return;
   try{

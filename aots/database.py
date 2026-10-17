@@ -52,6 +52,14 @@ class Database:
               key TEXT PRIMARY KEY,
               value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS strategy_decisions (
+              strategy_id TEXT NOT NULL,
+              observation_id TEXT NOT NULL,
+              input_hash TEXT NOT NULL,
+              decision_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY(strategy_id, observation_id)
+            );
             """)
             columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(trades)")
@@ -328,3 +336,56 @@ class Database:
             return [dict(r) for r in conn.execute(
                 "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()]
+
+    def process_strategy_decision(
+        self,
+        *,
+        strategy_id: str,
+        observation_id: str,
+        input_hash: str,
+        process,
+    ) -> dict:
+        """Serialize observation deduplication, callback effects, and decision storage."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT input_hash, decision_json FROM strategy_decisions
+                WHERE strategy_id=? AND observation_id=?
+                """,
+                (strategy_id, observation_id),
+            ).fetchone()
+            if existing:
+                if existing["input_hash"] != input_hash:
+                    raise IdempotencyConflict(
+                        "Observation ID was already processed with different inputs."
+                    )
+                return json.loads(existing["decision_json"])
+
+            decision = process(conn)
+            conn.execute(
+                """
+                INSERT INTO strategy_decisions(
+                  strategy_id, observation_id, input_hash, decision_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    strategy_id,
+                    observation_id,
+                    input_hash,
+                    json.dumps(decision, sort_keys=True, separators=(",", ":")),
+                    decision["evaluated_at"],
+                ),
+            )
+            return decision
+
+    def strategy_decisions(self, limit: int = 50) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT decision_json FROM strategy_decisions
+                ORDER BY created_at DESC, rowid DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row["decision_json"]) for row in rows]
