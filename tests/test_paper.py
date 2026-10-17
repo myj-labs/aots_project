@@ -876,6 +876,142 @@ def test_daily_pause_event_failure_rolls_back_close_and_pause(tmp_path, monkeypa
     )
 
 
+def _restart(settings, db, risk):
+    reopened_db = Database(db.path)
+    reopened_risk = RiskEngine(settings, reopened_db, clock=risk.current_time)
+    return reopened_db, reopened_risk, PaperBroker(settings, reopened_db, reopened_risk)
+
+
+def _event_types(db):
+    return [e["event_type"] for e in reversed(db.events())]
+
+
+def test_open_trade_mark_and_kill_switch_survive_database_reinitialisation(tmp_path):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    request = paper_request(key="restart-open", take_profit_profit_inr=500)
+    opened = broker.open_trade(request)
+    broker.mark(opened.trade_id, 104, observation_sequence=7)
+    risk.set_kill_switch(True)
+    before = next(t for t in db.trades() if t["trade_id"] == opened.trade_id)
+    events_before = _event_types(db)
+
+    reopened_db, reopened_risk, reopened_broker = _restart(settings, db, risk)
+
+    after = next(t for t in reopened_db.trades() if t["trade_id"] == opened.trade_id)
+    assert after == before
+    assert after["status"] == "OPEN"
+    assert after["idempotency_key"] == "restart-open"
+    assert (after["symbol"], after["side"], after["entry_price"], after["stop_price"]) == (
+        "NIFTY", "BUY", 100, 95,
+    )
+    assert (after["quantity"], after["lots"], after["take_profit_profit_inr"]) == (10, 1, 500)
+    assert after["mark_price"] == 104
+    assert after["mark_sequence"] == 7
+    assert after["unrealised_pnl"] == 40
+    assert after["realised_pnl"] == 0
+    assert after["closed_at"] is None and after["close_reason"] is None
+    snapshot = reopened_risk.snapshot()
+    assert snapshot.open_positions == 1
+    assert snapshot.unrealised_pnl == 40
+    assert snapshot.kill_switch is True
+    assert _event_types(reopened_db) == events_before
+
+    # Restart does not re-emit events, replays the entry idempotently, and keeps sequencing.
+    assert reopened_broker.open_trade(request).trade_id == opened.trade_id
+    assert _event_types(reopened_db) == events_before
+    with pytest.raises(ValueError, match="stale or duplicate"):
+        reopened_broker.mark(opened.trade_id, 90, observation_sequence=7)
+    assert next(t for t in reopened_db.trades())["mark_price"] == 104
+    resumed = reopened_broker.mark(opened.trade_id, 106, observation_sequence=8)
+    assert (resumed.mark_sequence, resumed.unrealised_pnl) == (8, 60)
+
+
+def test_closed_trade_and_audit_events_survive_database_reinitialisation(tmp_path):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(paper_request(key="restart-closed", take_profit_profit_inr=100))
+    closed = broker.mark(opened.trade_id, 115, observation_sequence=3)
+    before_trades = db.trades()
+    before_events = db.events()
+
+    reopened_db, reopened_risk, reopened_broker = _restart(settings, db, risk)
+
+    assert reopened_db.trades() == before_trades
+    assert reopened_db.events() == before_events
+    persisted = reopened_db.trades()[0]
+    assert persisted["status"] == "CLOSED"
+    assert persisted["trade_id"] == closed.trade_id
+    assert (persisted["entry_price"], persisted["stop_price"], persisted["quantity"]) == (100, 95, 10)
+    assert persisted["mark_price"] == 115 and persisted["mark_sequence"] == 3
+    assert persisted["realised_pnl"] == 150 and persisted["unrealised_pnl"] == 0
+    assert persisted["close_reason"] == "SIMULATED_TAKE_PROFIT"
+    assert persisted["closed_at"] == closed.closed_at.isoformat()
+    assert _event_types(reopened_db) == [
+        "PAPER_TRADE_OPENED", "PAPER_TRADE_MARKED", "PAPER_TRADE_CLOSED",
+    ]
+    closed_detail = json.loads(reopened_db.events()[0]["detail_json"])
+    assert closed_detail == {
+        "trade_id": opened.trade_id, "exit_price": 115, "pnl": 150,
+        "reason": "SIMULATED_TAKE_PROFIT",
+    }
+    snapshot = reopened_risk.snapshot()
+    assert (snapshot.realised_pnl, snapshot.unrealised_pnl, snapshot.open_positions) == (150, 0, 0)
+
+    # A repeated close or later mark after restart changes nothing and adds no events.
+    with pytest.raises(ValueError, match="not open"):
+        reopened_broker.close_trade(opened.trade_id, exit_price=90)
+    with pytest.raises(ValueError, match="not open"):
+        reopened_broker.mark(opened.trade_id, 90, observation_sequence=4)
+    assert reopened_db.trades() == before_trades
+    assert reopened_db.events() == before_events
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments", "error", "message"),
+    [
+        ("mark", (float("nan"), 1), ValueError, "finite"),
+        ("mark", (float("inf"), 1), ValueError, "finite"),
+        ("mark", (0, 1), ValueError, "greater than zero"),
+        ("mark", (-5, 1), ValueError, "greater than zero"),
+        ("mark", (101, 0), ValueError, "positive integer"),
+        ("mark", (101, True), ValueError, "positive integer"),
+        ("mark", (101, 1.5), ValueError, "positive integer"),
+        ("close_trade", (float("nan"),), ValueError, "finite"),
+        ("close_trade", (0,), ValueError, "greater than zero"),
+    ],
+)
+def test_rejected_mark_or_close_leaves_trade_and_events_unchanged(
+    tmp_path, operation, arguments, error, message
+):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(paper_request())
+    before_trades, before_events = db.trades(), db.events()
+
+    with pytest.raises(error, match=message):
+        getattr(broker, operation)(opened.trade_id, *arguments)
+
+    assert db.trades() == before_trades
+    assert db.events() == before_events
+    assert risk.get_consecutive_losses() == 0
+
+
+@pytest.mark.parametrize("operation", ["mark", "close_trade"])
+def test_unknown_trade_id_is_rejected_without_side_effects(tmp_path, operation):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    broker.open_trade(paper_request())
+    before_trades, before_events = db.trades(), db.events()
+    arguments = (101, 1) if operation == "mark" else (101,)
+
+    with pytest.raises(KeyError):
+        getattr(broker, operation)("missing-trade", *arguments)
+
+    assert db.trades() == before_trades
+    assert db.events() == before_events
+
+
 def make_paper_services(tmp_path, **overrides):
     current_time = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
     settings = SimpleNamespace(

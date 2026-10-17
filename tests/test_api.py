@@ -689,8 +689,7 @@ def run_dashboard_refresh(tmp_path, steps, app_js=None):
     step and a snapshot of the rendered sections is returned for each.
     """
     script_path = Path(app_js) if app_js else _STATIC_DIR / "app.js"
-    html_text = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    harness = f"""<script>
+    return _run_harness_page(tmp_path, f"""<script>
 const STEPS = {json.dumps(steps)};
 let current = 0;
 window.fetch = async (path) => {{
@@ -716,7 +715,11 @@ window.fetch = async (path) => {{
   pre.textContent = JSON.stringify(out);
   document.body.appendChild(pre);
 }})();
-</script>"""
+</script>""")
+
+
+def _run_harness_page(tmp_path, harness):
+    html_text = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
     page = html_text.replace('<script src="/static/app.js"></script>', harness)
     assert harness in page
     page_path = tmp_path / "dashboard-harness.html"
@@ -732,6 +735,41 @@ window.fetch = async (path) => {{
     return json.loads(html.unescape(match.group(1)))
 
 
+def run_overlapping_refreshes(tmp_path, older, newer):
+    """Start two refreshes, answer the newer one first, then the older one, and snapshot."""
+    script_path = _STATIC_DIR / "app.js"
+    return _run_harness_page(tmp_path, f"""<script>
+const RESPONSES = {json.dumps({"older": older, "newer": newer})};
+const pending = [];
+window.fetch = (path) => new Promise(resolve => pending.push({{path, resolve}}));
+const answer = (entry, which) => {{
+  const route = RESPONSES[which][entry.path];
+  entry.resolve({{ok: route[0] < 400, status: route[0], json: async () => route[1]}});
+}};
+</script>
+<script src="{script_path.as_uri()}"></script>
+<script>
+(async () => {{
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  await sleep(20);
+  const olderRequests = pending.splice(0);   // the refresh started when the page loaded
+  refresh();                                  // a second, newer refresh
+  await sleep(20);
+  const newerRequests = pending.splice(0);
+  newerRequests.forEach(e => answer(e, "newer"));
+  await sleep(50);
+  olderRequests.forEach(e => answer(e, "older"));
+  await sleep(50);
+  const ids = ["health-label","capital","positions-count","trades-body","strategy-decisions"];
+  const out = [Object.fromEntries(ids.map(id => [id, {{text: document.getElementById(id).innerText}}]))];
+  const pre = document.createElement("pre");
+  pre.id = "snapshot";
+  pre.textContent = JSON.stringify(out);
+  document.body.appendChild(pre);
+}})();
+</script>""")
+
+
 def dashboard_steps(client, **overrides):
     """Real API payloads (open trade seeded by the caller) plus per-step failure overrides."""
     routes = {
@@ -744,6 +782,49 @@ def dashboard_steps(client, **overrides):
 
 
 needs_browser = pytest.mark.skipif(_BROWSER is None, reason="no headless Chrome/Edge available")
+
+
+def _older_and_newer_dashboard_state(client):
+    older = dashboard_steps(client)
+    older["/api/trades"] = (200, [])
+    older["/api/status"] = (200, {**older["/api/status"][1], "capital_inr": 111_111})
+    older["/api/risk"] = (200, {**older["/api/risk"][1], "open_positions": 0})
+    newer = dashboard_steps(client)
+    newer["/api/status"] = (200, {**newer["/api/status"][1], "capital_inr": 222_222})
+    return older, newer
+
+
+@needs_browser
+def test_older_refresh_response_cannot_overwrite_newer_dashboard_state(paper_api, tmp_path):
+    client, _, _, _ = paper_api
+    assert client.post("/api/paper/trade", json=trade_payload("overlap")).status_code == 200
+    older, newer = _older_and_newer_dashboard_state(client)
+
+    (snapshot,) = run_overlapping_refreshes(tmp_path, older, newer)
+
+    assert "₹2,22,222" in snapshot["capital"]["text"]
+    assert snapshot["positions-count"]["text"] == "1"
+    assert "NIFTY-DEMO-CE" in snapshot["trades-body"]["text"]
+    assert "No paper trades yet" not in snapshot["trades-body"]["text"]
+    assert snapshot["health-label"]["text"] == "System healthy · paper only"
+
+
+@needs_browser
+def test_older_failed_refresh_cannot_overwrite_newer_successful_dashboard_state(
+    paper_api, tmp_path
+):
+    client, _, _, _ = paper_api
+    assert client.post("/api/paper/trade", json=trade_payload("overlap-fail")).status_code == 200
+    older, newer = _older_and_newer_dashboard_state(client)
+    older["/api/trades"] = (503, {"detail": "late failure"})
+    older["/api/strategy/decisions"] = (503, {"detail": "late history failure"})
+
+    (snapshot,) = run_overlapping_refreshes(tmp_path, older, newer)
+
+    assert snapshot["health-label"]["text"] == "System healthy · paper only"
+    assert "NIFTY-DEMO-CE" in snapshot["trades-body"]["text"]
+    assert "unavailable" not in snapshot["trades-body"]["text"]
+    assert "unavailable" not in snapshot["strategy-decisions"]["text"]
 
 
 @needs_browser

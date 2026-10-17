@@ -18,11 +18,16 @@ function errorText(detail) {
   if(detail && typeof detail === "object") return String(detail.message || detail.msg || "Request failed");
   return detail;
 }
+let latestRefresh = 0;
 async function refresh() {
+  // Only the most recently started refresh may render; older responses are discarded.
+  const generation = ++latestRefresh;
+  const isCurrent = () => generation === latestRefresh;
   // Optional strategy history is fetched independently so its failure cannot block core sections.
   const decisionsResult = api("/api/strategy/decisions").then(value => ({value}), error => ({error}));
   try {
     const [status,risk,trades] = await Promise.all([api("/api/status"),api("/api/risk"),api("/api/trades")]);
+    if(!isCurrent()) return;
     $("health-label").textContent = "System healthy · paper only";
     $("capital").textContent = inr(status.capital_inr);
     $("strategy-threshold").textContent = status.strategy_spot_threshold == null ?
@@ -47,11 +52,13 @@ async function refresh() {
     $("kill-toggle").className = risk.kill_switch ? "" : "danger";
     renderTrades(trades);
   } catch(e) {
+    if(!isCurrent()) return;
     $("health-label").textContent = `API unavailable: ${e.message}`;
     $("risk-badge").textContent = "Data unavailable";
     $("trades-body").innerHTML = '<tr><td colspan="15" class="negative">Trades unavailable: core data could not be refreshed. Displayed values may be out of date.</td></tr>';
   }
   const decisions = await decisionsResult;
+  if(!isCurrent()) return;
   if(decisions.error) {
     $("strategy-decisions").innerHTML = `<tr><td colspan="5" class="negative">Strategy history unavailable: ${escapeHtml(decisions.error.message)}</td></tr>`;
   } else {
