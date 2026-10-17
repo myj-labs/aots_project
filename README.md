@@ -82,6 +82,19 @@ Paper-entry requests require a unique `idempotency_key` and an explicit finite `
 
 Paper mark requests require a positive `observation_sequence` that strictly increases per trade. Missing or malformed sequences return HTTP 422; a duplicate or lower sequence is rejected with HTTP 409 without recording an applied-mark event. The check, accepted mark, simulated-stop behavior, P&L, and audit events are applied atomically. The dashboard supplies the next local sequence for manual simulated marks. Since the application has no connected feed, callers must supply source-generated monotonic sequences to represent source observation order; server receipt order does not establish freshness. Existing SQLite trades are retained and migrated with `mark_sequence=0`.
 
+Paper entries may optionally include `take_profit_profit_inr`, a positive rupee-denominated total P&L target. For a quantity of 65 entered at ₹100, a target of ₹650 is reached when an accepted mark produces `(mark - entry) * quantity >= 650`, i.e. at a mark of ₹110 or above. The trade closes at the observed mark price and records `SIMULATED_TAKE_PROFIT`; the configured profit target is not treated as a premium price or assumed fill. The existing stop rule remains `mark_price <= stop_price` and is checked first. Trades without a target retain their existing stop/manual-close behavior. Existing databases are migrated additively with a nullable target and closure-reason column; if an earlier version stored a `take_profit_price` value, the migration preserves its numeric value as the rupee-denominated target.
+
+### Dashboard manual smoke check
+
+Automated tests verify that the dashboard and its sequence-aware script are served, but do not automate browser interaction. To exercise the UI against an isolated temporary ledger from the project root in Windows PowerShell:
+
+```powershell
+$env:AOTS_DATABASE_PATH = Join-Path $env:TEMP ("aots-sprint4-" + [guid]::NewGuid().ToString() + ".db")
+.\.venv\Scripts\python.exe -m uvicorn aots.api:app --reload
+```
+
+Open http://127.0.0.1:8000 and create a trade with entry `100`, stop `95`, quantity `65`, and take-profit profit target `650`. Mark it at `105` and confirm it remains open with unrealised P&L of ₹325; mark it at `110` and confirm it closes at the observed mark with ₹650 realised P&L and a “Take-profit reached” status. Create a second trade with take-profit blank, mark it at `90`, and confirm the existing simulated stop closes it with -₹650 realised P&L. Reload the page and confirm both closed trades remain in the ledger. These are manual paper-only checks; no broker order is sent.
+
 ## Risk model notes
 
 - The daily-loss limit is calculated against the configured starting capital and current-date realised + open-position unrealised P&L tracked by this local paper ledger. Trade closing dates use Asia/Kolkata.

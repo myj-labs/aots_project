@@ -19,6 +19,7 @@ class PaperBroker:
             side=req.side,
             entry_price=req.entry_price,
             stop_price=req.stop_price,
+            take_profit_profit_inr=req.take_profit_profit_inr,
             mark_price=req.entry_price,
             quantity=req.quantity,
             lots=req.lots,
@@ -66,13 +67,23 @@ class PaperBroker:
                 raise ValueError(
                     "Mark observation is stale or duplicate; sequence must be greater than the last accepted sequence."
                 )
-            pnl = (mark_price - float(trade["entry_price"])) * int(trade["quantity"])
+            pnl = round(
+                (mark_price - float(trade["entry_price"]))
+                * int(trade["quantity"]),
+                2,
+            )
             trade["mark_price"] = mark_price
             trade["mark_sequence"] = observation_sequence
+            take_profit_profit_inr = trade["take_profit_profit_inr"]
             if mark_price <= float(trade["stop_price"]):
-                self._prepare_close(trade, mark_price)
+                self._prepare_close(trade, mark_price, "SIMULATED_STOP")
+            elif (
+                take_profit_profit_inr is not None
+                and pnl >= float(take_profit_profit_inr)
+            ):
+                self._prepare_close(trade, mark_price, "SIMULATED_TAKE_PROFIT")
             else:
-                trade["unrealised_pnl"] = round(pnl, 2)
+                trade["unrealised_pnl"] = pnl
             return trade
 
         def after_transition(conn, trade):
@@ -88,11 +99,12 @@ class PaperBroker:
                     "mark_price": mark_price,
                     "observation_sequence": observation_sequence,
                     "unrealised_pnl": 0 if triggered else round(pnl, 2),
+                    "close_reason": trade["close_reason"],
                 },
                 conn=conn,
             )
             if triggered:
-                self._record_close(conn, trade, "SIMULATED_STOP")
+                self._record_close(conn, trade, trade["close_reason"])
 
         trade = self.db.transition_open_trade(
             trade_id, prepare_transition, after_transition
@@ -105,7 +117,7 @@ class PaperBroker:
         if not isfinite(exit_price) or exit_price <= 0:
             raise ValueError("Exit price must be finite and greater than zero.")
         def prepare_transition(trade):
-            self._prepare_close(trade, exit_price)
+            self._prepare_close(trade, exit_price, reason)
             return trade
 
         def after_transition(conn, trade):
@@ -118,7 +130,7 @@ class PaperBroker:
             raise ValueError("Trade is not open.")
         return self._as_model(trade)
 
-    def _prepare_close(self, trade, exit_price: float):
+    def _prepare_close(self, trade, exit_price: float, reason: str):
         pnl = round(
             (exit_price - float(trade["entry_price"])) * int(trade["quantity"]),
             2,
@@ -128,6 +140,7 @@ class PaperBroker:
         trade["status"] = "CLOSED"
         trade["realised_pnl"] = pnl
         trade["unrealised_pnl"] = 0
+        trade["close_reason"] = reason
         trade["closed_at"] = closed_at.isoformat()
 
     def _record_close(self, conn, trade, reason):

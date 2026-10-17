@@ -48,6 +48,7 @@ def test_paper_trade_open_mark_close_lifecycle_uses_long_option_pnl(tmp_path):
     closed = broker.close_trade(opened.trade_id, exit_price=120)
 
     assert closed.status == "CLOSED"
+    assert closed.close_reason == "MANUAL"
     assert closed.realised_pnl == 200
     assert closed.unrealised_pnl == 0
     assert closed.closed_at == current_time[0]
@@ -79,10 +80,149 @@ def test_stop_trigger_mark_event_matches_persisted_closed_trade(tmp_path):
     assert persisted["unrealised_pnl"] == 0
     assert persisted["realised_pnl"] == -100
     assert persisted["mark_sequence"] == 1
+    assert persisted["close_reason"] == "SIMULATED_STOP"
     assert marked_detail["unrealised_pnl"] == 0
     assert marked_detail["observation_sequence"] == 1
     assert closed_detail["pnl"] == -100
     assert closed_detail["reason"] == "SIMULATED_STOP"
+
+
+@pytest.mark.parametrize(
+    ("mark_price", "expected_status", "expected_reason", "expected_pnl"),
+    [
+        (109, "OPEN", None, 90),
+        (110, "CLOSED", "SIMULATED_TAKE_PROFIT", 100),
+        (115, "CLOSED", "SIMULATED_TAKE_PROFIT", 150),
+    ],
+)
+def test_take_profit_closes_at_accepted_observed_mark(
+    tmp_path, mark_price, expected_status, expected_reason, expected_pnl
+):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(paper_request(take_profit_profit_inr=100))
+
+    result = broker.mark(opened.trade_id, mark_price, observation_sequence=1)
+    persisted = db.trades()[0]
+    events = list(reversed(db.events()))
+    mark_event = next(e for e in events if e["event_type"] == "PAPER_TRADE_MARKED")
+    close_events = [e for e in events if e["event_type"] == "PAPER_TRADE_CLOSED"]
+
+    assert result.status == expected_status
+    assert persisted["status"] == expected_status
+    assert persisted["mark_price"] == mark_price
+    assert persisted["take_profit_profit_inr"] == 100
+    assert persisted["realised_pnl"] == (expected_pnl if expected_status == "CLOSED" else 0)
+    assert persisted["unrealised_pnl"] == (0 if expected_status == "CLOSED" else expected_pnl)
+    assert persisted["close_reason"] == expected_reason
+    assert json.loads(mark_event["detail_json"])["close_reason"] == expected_reason
+    if expected_reason is None:
+        assert not close_events
+        assert risk.snapshot().unrealised_pnl == expected_pnl
+    else:
+        assert len(close_events) == 1
+        close_detail = json.loads(close_events[0]["detail_json"])
+        assert close_detail["exit_price"] == mark_price
+        assert close_detail["pnl"] == expected_pnl
+        assert close_detail["reason"] == expected_reason
+        assert risk.snapshot().realised_pnl == expected_pnl
+        assert risk.snapshot().unrealised_pnl == 0
+
+
+@pytest.mark.parametrize("target", [0, -1, float("inf"), float("nan")])
+def test_take_profit_target_must_be_finite_and_positive(tmp_path, target):
+    with pytest.raises(ValueError):
+        paper_request(take_profit_profit_inr=target)
+
+
+def test_stale_take_profit_observation_cannot_close_or_change_state(tmp_path):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(paper_request(take_profit_profit_inr=100))
+    broker.mark(opened.trade_id, 105, observation_sequence=2)
+    before_trade = db.trades()[0]
+    before_events = db.events()
+    before_risk = risk.snapshot()
+
+    for sequence in (1, 2):
+        with pytest.raises(ValueError, match="stale or duplicate"):
+            broker.mark(opened.trade_id, 120, observation_sequence=sequence)
+
+    assert db.trades()[0] == before_trade
+    assert db.events() == before_events
+    assert risk.snapshot() == before_risk
+    assert db.trades()[0]["status"] == "OPEN"
+
+
+def test_manual_close_with_take_profit_keeps_manual_reason_and_closes_once(tmp_path):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(paper_request(take_profit_profit_inr=100))
+
+    closed = broker.close_trade(opened.trade_id, exit_price=108)
+    before_events = db.events()
+
+    with pytest.raises(ValueError, match="not open"):
+        broker.close_trade(opened.trade_id, exit_price=120)
+    with pytest.raises(ValueError, match="not open"):
+        broker.mark(opened.trade_id, 120, observation_sequence=1)
+
+    assert closed.close_reason == "MANUAL"
+    assert db.trades()[0]["status"] == "CLOSED"
+    assert db.trades()[0]["mark_price"] == 108
+    assert db.trades()[0]["realised_pnl"] == 80
+    assert db.trades()[0]["close_reason"] == "MANUAL"
+    assert db.events() == before_events
+    assert sum(e["event_type"] == "PAPER_TRADE_CLOSED" for e in db.events()) == 1
+    assert risk.snapshot().realised_pnl == 80
+
+
+def test_stop_has_priority_for_corrupt_overlapping_exit_thresholds(tmp_path):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(paper_request(take_profit_profit_inr=100))
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE trades SET take_profit_profit_inr=1 WHERE trade_id=?",
+            (opened.trade_id,),
+        )
+
+    closed = broker.mark(opened.trade_id, 94.5, observation_sequence=1)
+    close_event = next(
+        e for e in reversed(db.events()) if e["event_type"] == "PAPER_TRADE_CLOSED"
+    )
+
+    assert closed.status == "CLOSED"
+    assert closed.close_reason == "SIMULATED_STOP"
+    assert closed.mark_price == 94.5
+    assert json.loads(close_event["detail_json"])["reason"] == "SIMULATED_STOP"
+
+
+def test_concurrent_take_profit_marks_close_once(tmp_path):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(paper_request(take_profit_profit_inr=100))
+    barrier = Barrier(2)
+
+    def mark(price, sequence):
+        barrier.wait()
+        try:
+            return broker.mark(opened.trade_id, price, sequence)
+        except ValueError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda args: mark(*args), ((110, 1), (120, 2))))
+
+    assert sum(not isinstance(result, ValueError) for result in results) == 1
+    assert sum(isinstance(result, ValueError) for result in results) == 1
+    persisted = db.trades()[0]
+    assert persisted["status"] == "CLOSED"
+    assert persisted["close_reason"] == "SIMULATED_TAKE_PROFIT"
+    assert persisted["mark_price"] in {110, 120}
+    assert persisted["mark_sequence"] in {1, 2}
+    assert sum(e["event_type"] == "PAPER_TRADE_CLOSED" for e in db.events()) == 1
+    assert risk.get_consecutive_losses() == 0
 
 
 def test_concurrent_out_of_order_marks_keep_newest_sequence(tmp_path, monkeypatch):
@@ -374,6 +514,9 @@ def test_reusing_idempotency_key_for_different_order_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="different trade"):
         broker.open_trade(paper_request(entry_price=101, stop_price=96))
 
+    with pytest.raises(ValueError, match="different trade"):
+        broker.open_trade(paper_request(take_profit_profit_inr=100))
+
     assert len(db.trades()) == 1
 
 
@@ -417,6 +560,7 @@ def test_concurrent_duplicate_exits_only_close_and_account_once(tmp_path):
     assert sum(isinstance(result, ValueError) for result in results) == 1
     assert db.trades()[0]["status"] == "CLOSED"
     assert db.trades()[0]["realised_pnl"] == -100
+    assert db.trades()[0]["close_reason"] == "MANUAL"
     assert risk.get_consecutive_losses() == 1
     assert sum(e["event_type"] == "PAPER_TRADE_CLOSED" for e in db.events()) == 1
 
@@ -457,6 +601,7 @@ def test_close_event_failure_rolls_back_trade_and_risk_state(tmp_path, monkeypat
 
     assert db.trades()[0]["status"] == "OPEN"
     assert db.trades()[0]["realised_pnl"] == 0
+    assert db.trades()[0]["close_reason"] is None
     assert risk.get_consecutive_losses() == 0
     assert not any(e["event_type"] == "PAPER_TRADE_CLOSED" for e in db.events())
 
@@ -565,8 +710,44 @@ def test_database_migration_preserves_legacy_trade_rows(tmp_path):
     assert db.trades()[0]["trade_id"] == "legacy"
     with db.connect() as conn:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
-    assert {"idempotency_key", "mark_sequence"} <= columns
+    assert {
+        "idempotency_key",
+        "mark_sequence",
+        "take_profit_profit_inr",
+        "close_reason",
+    } <= columns
     assert db.trades()[0]["mark_sequence"] == 0
+    assert db.trades()[0]["take_profit_profit_inr"] is None
+    assert db.trades()[0]["close_reason"] is None
+
+
+def test_database_migration_converts_legacy_premium_target_to_total_profit(tmp_path):
+    path = str(tmp_path / "legacy-target.db")
+    with sqlite3.connect(path) as conn:
+        conn.executescript("""
+            CREATE TABLE trades (
+              trade_id TEXT PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL,
+              entry_price REAL NOT NULL, stop_price REAL NOT NULL,
+              take_profit_price REAL, mark_price REAL NOT NULL,
+              quantity INTEGER NOT NULL, lots INTEGER NOT NULL, status TEXT NOT NULL,
+              realised_pnl REAL NOT NULL DEFAULT 0,
+              unrealised_pnl REAL NOT NULL DEFAULT 0,
+              mark_sequence INTEGER NOT NULL DEFAULT 0,
+              close_reason TEXT, created_at TEXT NOT NULL, closed_at TEXT
+            );
+            INSERT INTO trades VALUES (
+              'legacy-target', 'NIFTY', 'BUY', 100, 95, 650, 100,
+              65, 1, 'OPEN', 0, 0, 0, NULL,
+              '2025-01-03T04:00:00+00:00', NULL
+            );
+        """)
+
+    db = Database(path)
+    migrated = db.trades()[0]
+
+    assert migrated["trade_id"] == "legacy-target"
+    assert migrated["take_profit_price"] == 650
+    assert migrated["take_profit_profit_inr"] == 650
 
 
 def test_daily_pause_event_failure_rolls_back_close_and_pause(tmp_path, monkeypatch):

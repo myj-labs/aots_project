@@ -30,6 +30,7 @@ class Database:
               side TEXT NOT NULL,
               entry_price REAL NOT NULL,
               stop_price REAL NOT NULL,
+              take_profit_profit_inr REAL,
               mark_price REAL NOT NULL,
               quantity INTEGER NOT NULL,
               lots INTEGER NOT NULL,
@@ -37,6 +38,7 @@ class Database:
               realised_pnl REAL NOT NULL DEFAULT 0,
               unrealised_pnl REAL NOT NULL DEFAULT 0,
               mark_sequence INTEGER NOT NULL DEFAULT 0,
+              close_reason TEXT,
               created_at TEXT NOT NULL,
               closed_at TEXT
             );
@@ -66,6 +68,20 @@ class Database:
                 conn.execute(
                     "ALTER TABLE trades ADD COLUMN mark_sequence INTEGER NOT NULL DEFAULT 0"
                 )
+            if "take_profit_profit_inr" not in columns:
+                conn.execute(
+                    "ALTER TABLE trades ADD COLUMN take_profit_profit_inr REAL"
+                )
+                if "take_profit_price" in columns:
+                    conn.execute(
+                        """
+                        UPDATE trades
+                        SET take_profit_profit_inr = take_profit_price
+                        WHERE take_profit_price IS NOT NULL
+                        """
+                    )
+            if "close_reason" not in columns:
+                conn.execute("ALTER TABLE trades ADD COLUMN close_reason TEXT")
 
     def event(self, event_type: str, detail: dict[str, Any], conn=None):
         if conn is not None:
@@ -190,14 +206,16 @@ class Database:
                 self.insert_trade(trade, conn=connection)
             return
         conn.execute("""
-            INSERT INTO trades(trade_id,idempotency_key,symbol,side,entry_price,stop_price,mark_price,
-              quantity,lots,status,realised_pnl,unrealised_pnl,mark_sequence,created_at,closed_at)
-            VALUES (:trade_id,:idempotency_key,:symbol,:side,:entry_price,:stop_price,:mark_price,
-              :quantity,:lots,:status,:realised_pnl,:unrealised_pnl,:mark_sequence,:created_at,:closed_at)
+            INSERT INTO trades(trade_id,idempotency_key,symbol,side,entry_price,stop_price,take_profit_profit_inr,mark_price,
+              quantity,lots,status,realised_pnl,unrealised_pnl,mark_sequence,close_reason,created_at,closed_at)
+            VALUES (:trade_id,:idempotency_key,:symbol,:side,:entry_price,:stop_price,:take_profit_profit_inr,:mark_price,
+              :quantity,:lots,:status,:realised_pnl,:unrealised_pnl,:mark_sequence,:close_reason,:created_at,:closed_at)
         """, {
             **trade,
             "idempotency_key": trade.get("idempotency_key"),
             "mark_sequence": trade.get("mark_sequence", 0),
+            "take_profit_profit_inr": trade.get("take_profit_profit_inr"),
+            "close_reason": trade.get("close_reason"),
         })
 
     def insert_trade_atomically(
@@ -230,7 +248,7 @@ class Database:
                 previous = dict(existing)
                 comparable_fields = (
                     "symbol", "side", "entry_price", "stop_price",
-                    "quantity", "lots",
+                    "take_profit_profit_inr", "quantity", "lots",
                 )
                 if any(previous[field] != trade[field] for field in comparable_fields):
                     raise IdempotencyConflict(
@@ -267,9 +285,14 @@ class Database:
             conn.execute("""
                 UPDATE trades SET mark_price=:mark_price,status=:status,
                   realised_pnl=:realised_pnl,unrealised_pnl=:unrealised_pnl,
-                mark_sequence=COALESCE(:mark_sequence,mark_sequence),closed_at=:closed_at
+                mark_sequence=COALESCE(:mark_sequence,mark_sequence),
+                close_reason=COALESCE(:close_reason,close_reason),closed_at=:closed_at
                 WHERE trade_id=:trade_id
-                """, {**trade, "mark_sequence": trade.get("mark_sequence")})
+                  """, {
+                      **trade,
+                      "mark_sequence": trade.get("mark_sequence"),
+                      "close_reason": trade.get("close_reason"),
+                  })
 
     def transition_open_trade(self, trade_id: str, prepare_transition, after_transition):
         """Read, prepare, persist, and audit one open-trade transition atomically."""
@@ -287,7 +310,8 @@ class Database:
                 """
                 UPDATE trades SET mark_price=:mark_price,status=:status,
                   realised_pnl=:realised_pnl,unrealised_pnl=:unrealised_pnl,
-                  mark_sequence=:mark_sequence,closed_at=:closed_at
+                  mark_sequence=:mark_sequence,close_reason=:close_reason,
+                  closed_at=:closed_at
                 WHERE trade_id=:trade_id AND status='OPEN'
                 """,
                 trade,

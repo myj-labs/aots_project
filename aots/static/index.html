@@ -47,6 +47,7 @@
           <label>Entry price (₹)<input name="entry_price" type="number" min="0.05" step="0.05" value="100" required></label>
           <label>Stop price (₹)<input name="stop_price" type="number" min="0.05" step="0.05" value="95" required></label>
         </div>
+        <label>Take-profit profit target (₹ total, optional)<input name="take_profit_profit_inr" type="number" min="0.01" step="0.01" placeholder="e.g. 650"><small>Automatically exit when the calculated total trade profit reaches or exceeds this amount.</small></label>
         <div class="form-row">
           <label>Quantity<input name="quantity" type="number" min="1" step="1" value="65" required></label>
           <label>Lots<input name="lots" type="number" min="1" max="10" step="1" value="1" required></label>
@@ -59,7 +60,7 @@
   </section>
   <section class="panel">
     <div class="panel-heading"><div><h2>Paper positions &amp; trade ledger</h2><p class="muted">Update marks or close trades to exercise risk controls.</p></div></div>
-    <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Status</th><th>Qty</th><th>Entry</th><th>Mark / Exit</th><th>P&amp;L</th><th>Actions</th></tr></thead><tbody id="trades-body"><tr><td colspan="7">Loading trades…</td></tr></tbody></table></div>
+    <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Status</th><th>Qty</th><th>Entry</th><th>Take profit</th><th>Mark / Exit</th><th>P&amp;L</th><th>Actions</th></tr></thead><tbody id="trades-body"><tr><td colspan="8">Loading trades…</td></tr></tbody></table></div>
   </section>
   <section class="panel">
     <div class="panel-heading"><div><h2>System boundary</h2><p class="muted">The current app is deliberately not connected to a broker.</p></div></div>
