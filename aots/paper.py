@@ -49,13 +49,26 @@ class PaperBroker:
         )
         return self._as_model(result)
 
-    def mark(self, trade_id: str, mark_price: float):
+    def mark(
+        self, trade_id: str, mark_price: float, observation_sequence: int
+    ):
         if not isfinite(mark_price) or mark_price <= 0:
             raise ValueError("Mark price must be finite and greater than zero.")
+        if (
+            not isinstance(observation_sequence, int)
+            or isinstance(observation_sequence, bool)
+            or observation_sequence <= 0
+        ):
+            raise ValueError("Observation sequence must be a positive integer.")
 
         def prepare_transition(trade):
+            if observation_sequence <= trade["mark_sequence"]:
+                raise ValueError(
+                    "Mark observation is stale or duplicate; sequence must be greater than the last accepted sequence."
+                )
             pnl = (mark_price - float(trade["entry_price"])) * int(trade["quantity"])
             trade["mark_price"] = mark_price
+            trade["mark_sequence"] = observation_sequence
             if mark_price <= float(trade["stop_price"]):
                 self._prepare_close(trade, mark_price)
             else:
@@ -73,6 +86,7 @@ class PaperBroker:
                 {
                     "trade_id": trade_id,
                     "mark_price": mark_price,
+                    "observation_sequence": observation_sequence,
                     "unrealised_pnl": 0 if triggered else round(pnl, 2),
                 },
                 conn=conn,

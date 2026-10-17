@@ -38,6 +38,11 @@ class PaperTradeRequest(BaseModel):
 class MarkPriceRequest(BaseModel):
     trade_id: str
     mark_price: float = Field(gt=0, allow_inf_nan=False)
+    observation_sequence: int = Field(
+        gt=0,
+        strict=True,
+        description="Caller-provided increasing per-trade source observation sequence.",
+    )
 
 
 class KillSwitchRequest(BaseModel):
@@ -56,5 +61,6 @@ class PaperTrade(BaseModel):
     status: Literal["OPEN", "CLOSED"]
     realised_pnl: float = 0
     unrealised_pnl: float = 0
+    mark_sequence: int = 0
     created_at: datetime
     closed_at: datetime | None = None

@@ -36,7 +36,7 @@ function renderTrades(trades) {
     const pnl = t.status==="OPEN" ? Number(t.unrealised_pnl) : Number(t.realised_pnl);
     const pnlClass = pnl >= 0 ? "positive" : "negative";
     const actions = t.status==="OPEN" ?
-      `<button data-action="mark" data-id="${t.trade_id}">Mark</button><button data-action="close" data-id="${t.trade_id}">Close</button>` : "—";
+      `<button data-action="mark" data-id="${t.trade_id}" data-sequence="${t.mark_sequence+1}">Mark</button><button data-action="close" data-id="${t.trade_id}">Close</button>` : "—";
     return `<tr><td>${escapeHtml(t.symbol)}</td><td>${t.status}</td><td>${t.quantity} (${t.lots} lot)</td><td>${inr(t.entry_price)}</td><td>${inr(t.mark_price)}</td><td class="${pnlClass}">${inr(pnl)}</td><td>${actions}</td></tr>`;
   }).join("");
 }
@@ -64,12 +64,12 @@ $("trades-body").addEventListener("click",async(e)=>{
   try{
     if(b.dataset.action==="mark"){
       const raw=prompt("Enter simulated option mark price (₹):","98"); if(raw===null)return;
-      await api("/api/paper/mark",{method:"POST",body:JSON.stringify({trade_id:b.dataset.id,mark_price:Number(raw)})});
+      await api("/api/paper/mark",{method:"POST",body:JSON.stringify({trade_id:b.dataset.id,mark_price:Number(raw),observation_sequence:Number(b.dataset.sequence)})});
     } else {
       const raw=prompt("Enter simulated exit price (₹):","98"); if(raw===null)return;
       await api(`/api/paper/close/${b.dataset.id}?exit_price=${encodeURIComponent(Number(raw))}`,{method:"POST"});
     }
     await refresh();
-  }catch(err){alert(err.message);}
+  }catch(err){await refresh();alert(err.message);}
 });
 refresh();
