@@ -5,8 +5,18 @@ let entryRequestActive = false;
 async function api(path, options={}) {
   const res = await fetch(path,{headers:{"Content-Type":"application/json"},...options});
   const body = await res.json().catch(()=>({detail:"Unexpected response"}));
-  if(!res.ok) throw new Error(body.detail || `Request failed (${res.status})`);
+  if(!res.ok) throw new Error(errorText(body.detail) || `Request failed (${res.status})`);
   return body;
+}
+function errorText(detail) {
+  if(Array.isArray(detail)) {
+    return detail.map(d => {
+      const field = Array.isArray(d.loc) ? d.loc.filter(p => p !== "body").join(".") : "";
+      return field ? `${field}: ${d.msg}` : String(d.msg || "Invalid request");
+    }).join("; ");
+  }
+  if(detail && typeof detail === "object") return String(detail.message || detail.msg || "Request failed");
+  return detail;
 }
 async function refresh() {
   // Optional strategy history is fetched independently so its failure cannot block core sections.

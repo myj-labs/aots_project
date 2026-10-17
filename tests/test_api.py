@@ -803,6 +803,19 @@ def test_dashboard_reports_core_request_failure_without_claiming_fresh_data(
     assert "<i>" not in after["health-label"]["html"]
 
 
+@needs_browser
+def test_dashboard_formats_validation_error_details_instead_of_object_object(paper_api, tmp_path):
+    client, _, _, _ = paper_api
+    detail = [{"loc": ["body", "spot"], "msg": "Input should be greater than 0", "type": "x"}]
+    steps = [dashboard_steps(client, **{"/api/status": (422, {"detail": detail})})]
+
+    (snapshot,) = run_dashboard_refresh(tmp_path, steps)
+
+    label = snapshot["health-label"]["text"]
+    assert label == "API unavailable: spot: Input should be greater than 0"
+    assert "[object Object]" not in label
+
+
 def teardown_module():
     if _original_database_path is None:
         os.environ.pop("AOTS_DATABASE_PATH", None)
