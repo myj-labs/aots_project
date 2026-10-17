@@ -36,6 +36,26 @@ def test_dashboard_loads():
     assert r.status_code == 200
     assert "AOTS" in r.text
     assert "PAPER MODE" in r.text
+    for label in (
+        "Realised today",
+        "Open unrealised",
+        "Daily entry pause",
+        "Position side",
+        "Option type",
+        "Stop premium",
+        "Total profit target",
+        "Entered (IST)",
+        "Closed (IST)",
+        "Closure reason",
+        "mark freshness is unavailable",
+    ):
+        assert label in r.text
+
+    script = client.get("/static/app.js")
+    assert script.status_code == 200
+    assert "Open unrealised" in script.text
+    assert "Closed realised" in script.text
+    assert 'timeZone:"Asia/Kolkata"' in script.text
 
 
 def test_mark_endpoint_requires_observation_sequence():
@@ -333,6 +353,11 @@ def test_api_take_profit_persists_and_closes_with_observed_mark(paper_api, monke
     assert created.status_code == 200
     trade_id = created.json()["trade_id"]
     assert created.json()["take_profit_profit_inr"] == 650
+    assert created.json()["side"] == "BUY"
+    assert created.json()["quantity"] == 65
+    assert created.json()["lots"] == 1
+    assert created.json()["created_at"]
+    assert created.json()["stop_price"] == 95
 
     reopened_db = Database(db.path)
     reopened_risk = RiskEngine(
@@ -388,11 +413,23 @@ def test_api_take_profit_persists_and_closes_with_observed_mark(paper_api, monke
     assert closed["close_reason"] == "SIMULATED_TAKE_PROFIT"
     assert closed["realised_pnl"] == 650
     assert closed["unrealised_pnl"] == 0
-    assert client.get("/api/trades").json()[0]["close_reason"] == (
-        "SIMULATED_TAKE_PROFIT"
+    assert closed["closed_at"]
+    stored_trade = client.get("/api/trades").json()[0]
+    assert stored_trade["close_reason"] == "SIMULATED_TAKE_PROFIT"
+    stored_closed_at = datetime.fromisoformat(
+        stored_trade["closed_at"].replace("Z", "+00:00")
     )
+    response_closed_at = datetime.fromisoformat(
+        closed["closed_at"].replace("Z", "+00:00")
+    )
+    assert stored_closed_at == response_closed_at
+    assert stored_trade["mark_price"] == 110
     assert client.get("/api/positions").json() == []
-    assert client.get("/api/risk").json()["realised_pnl"] == 650
+    risk_after_close = client.get("/api/risk").json()
+    assert risk_after_close["realised_pnl"] == 650
+    assert risk_after_close["unrealised_pnl"] == 0
+    assert risk_after_close["daily_pnl"] == 650
+    assert risk_after_close["open_positions"] == 0
 
     closed_again = client.post(
         "/api/paper/mark",
@@ -502,7 +539,7 @@ def test_dashboard_serves_trade_controls_and_sequence_aware_script(paper_api):
     assert 'id="trade-form"' in page.text
     assert 'id="trades-body"' in page.text
     assert script.status_code == 200
-    assert 'data-sequence="${t.mark_sequence+1}"' in script.text
+    assert 'data-sequence="${Number(t.mark_sequence)+1}"' in script.text
     assert 'observation_sequence:Number(b.dataset.sequence)' in script.text
     assert 'name="take_profit_profit_inr"' in page.text
     assert "Total quantity (all lots)" in page.text

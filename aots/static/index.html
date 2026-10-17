@@ -20,11 +20,13 @@
 </header>
 <main>
   <section class="warning">
-    <strong>Paper trading only.</strong> Simulated orders never reach Groww. The local kill switch blocks new paper entries; it does not cancel broker orders or square off a real account.
+    <strong>Paper trading only.</strong> Simulated orders never reach Groww. Marks are entered manually; there is no live market-data feed or source observation timestamp, so mark freshness is unavailable. The local kill switch blocks new paper entries; it does not cancel broker orders or square off a real account.
   </section>
   <section class="cards">
     <article class="metric"><span>Illustrative capital</span><strong id="capital">₹100,000</strong><small>Configured starting capital</small></article>
-    <article class="metric"><span>Paper P&amp;L</span><strong id="pnl">₹0.00</strong><small>Realised + unrealised</small></article>
+    <article class="metric"><span>Daily P&amp;L (realised + open)</span><strong id="pnl">₹0.00</strong><small>Current Asia/Kolkata date</small></article>
+    <article class="metric"><span>Realised today</span><strong id="realised-pnl">₹0.00</strong><small>Closed trades only</small></article>
+    <article class="metric"><span>Open unrealised</span><strong id="unrealised-pnl">₹0.00</strong><small>Not realised profit</small></article>
     <article class="metric"><span>Open positions</span><strong id="positions-count">0</strong><small>Simulated positions only</small></article>
     <article class="metric"><span>Max daily loss</span><strong id="loss-limit">₹2,000</strong><small>Entry gate threshold</small></article>
   </section>
@@ -34,6 +36,7 @@
       <div class="risk-list">
         <div><span>Per-trade risk</span><strong id="trade-risk">0.5% · ₹500</strong></div>
         <div><span>Consecutive losses</span><strong id="loss-streak">0 / 3</strong></div>
+        <div><span>Daily entry pause</span><strong id="pause-status">Not paused</strong></div>
         <div><span>Daily P&amp;L</span><strong id="daily-pnl">₹0.00</strong></div>
         <div><span>Entry kill switch</span><strong id="kill-status">OFF</strong></div>
       </div>
@@ -60,7 +63,7 @@
   </section>
   <section class="panel">
     <div class="panel-heading"><div><h2>Paper positions &amp; trade ledger</h2><p class="muted">Update marks or close trades to exercise risk controls.</p></div></div>
-    <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Status</th><th>Qty</th><th>Entry</th><th>Take profit</th><th>Mark / Exit</th><th>P&amp;L</th><th>Actions</th></tr></thead><tbody id="trades-body"><tr><td colspan="8">Loading trades…</td></tr></tbody></table></div>
+    <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Position side</th><th>Option type</th><th>Status</th><th>Entry premium</th><th>Stop premium</th><th>Total profit target (₹)</th><th>Last accepted manual mark / exit</th><th>Total quantity</th><th>Lots</th><th>P&amp;L type / amount</th><th>Entered (IST)</th><th>Closed (IST)</th><th>Closure reason</th><th>Actions</th></tr></thead><tbody id="trades-body"><tr><td colspan="15">Loading trades…</td></tr></tbody></table></div>
   </section>
   <section class="panel">
     <div class="panel-heading"><div><h2>System boundary</h2><p class="muted">The current app is deliberately not connected to a broker.</p></div></div>

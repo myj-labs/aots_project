@@ -84,16 +84,72 @@ Paper mark requests require a positive `observation_sequence` that strictly incr
 
 Paper entries may optionally include `take_profit_profit_inr`, a positive rupee-denominated total P&L target. P&L uses `(mark - entry) * quantity`, where `quantity` is the total option units across all lots; `lots` is not multiplied in again. For 10 lots of 65 units, submit `quantity=650, lots=10`. At an entry premium of ₹100, a ₹1,500 target is reached at or above a mark of ₹102.31 (₹1,501.50 profit). The trade closes at the accepted observed mark and records `SIMULATED_TAKE_PROFIT`; it does not assume a fill at a different price. This starter does not maintain an instrument lot-size master, so callers must supply the correct total quantity. The existing stop rule remains `mark_price <= stop_price` and is checked first. Trades without a target retain their existing stop/manual-close behavior. Existing databases are migrated additively with a nullable target and closure-reason column. A legacy `take_profit_price` premium column is preserved as-is but is not copied to the rupee target; the new target remains disabled for those records unless explicitly set.
 
-### Dashboard manual smoke check
+### Complete local paper-trading workflow (Windows PowerShell)
 
-Automated tests verify that the dashboard and its sequence-aware script are served, but do not automate browser interaction. To exercise the UI against an isolated temporary ledger from the project root in Windows PowerShell:
+This workflow uses a separate SQLite file in the Windows temporary directory. Start the server from one PowerShell window and keep it open:
 
 ```powershell
-$env:AOTS_DATABASE_PATH = Join-Path $env:TEMP ("aots-sprint4-" + [guid]::NewGuid().ToString() + ".db")
+$env:AOTS_DATABASE_PATH = Join-Path $env:TEMP ("aots-sprint5-" + [guid]::NewGuid().ToString() + ".db")
+Write-Host "Paper database: $env:AOTS_DATABASE_PATH"
 .\.venv\Scripts\python.exe -m uvicorn aots.api:app --reload
 ```
 
-Open http://127.0.0.1:8000 and create a trade with entry `100`, stop `95`, total quantity `65`, and take-profit profit target `650`. Mark it at `105` and confirm it remains open with unrealised P&L of ₹325; mark it at `110` and confirm it closes at the observed mark with ₹650 realised P&L and a “Take-profit reached” status. Create a second trade with take-profit blank, mark it at `90`, and confirm the existing simulated stop closes it with -₹650 realised P&L. Reload the page and confirm both closed trades remain in the ledger. These are manual paper-only checks; no broker order is sent.
+Open http://127.0.0.1:8000 for the dashboard and http://127.0.0.1:8000/docs for the API. The dashboard displays open unrealised and closed realised P&L separately, closure details and timestamps in Asia/Kolkata time. The option type is shown as unavailable because the trade model does not persist call/put contract classification. Marks are entered manually; there is no market-data feed or source timestamp, so freshness cannot be verified.
+
+In a second PowerShell window, set the database path to the exact path printed by the server window (copy the whole path, including the `.db` suffix), then create a simulated paper trade:
+
+```powershell
+$env:AOTS_DATABASE_PATH = "PASTE THE PAPER DATABASE PATH PRINTED BY THE SERVER"
+$base = "http://127.0.0.1:8000"
+$tradeRequest = @{
+  symbol = "NIFTY-DEMO-CE"
+  idempotency_key = "sprint5-local-demo"
+  side = "BUY"
+  entry_price = 100
+  stop_price = 95
+  take_profit_profit_inr = 100
+  quantity = 10
+  lots = 1
+  market_data_age_seconds = 0
+}
+$trade = Invoke-RestMethod "$base/api/paper/trade" -Method Post `
+  -ContentType "application/json" -Body ($tradeRequest | ConvertTo-Json)
+$tradeId = $trade.trade_id
+```
+
+The position is 10 total option units, not 10 multiplied by the lot count a second time. Submit a mark below target; the ₹50 unrealised profit should leave the trade open:
+
+```powershell
+$mark = @{ trade_id = $tradeId; mark_price = 105; observation_sequence = 1 }
+Invoke-RestMethod "$base/api/paper/mark" -Method Post `
+  -ContentType "application/json" -Body ($mark | ConvertTo-Json)
+```
+
+Confirm a duplicate/stale observation is rejected without changing the ledger, then submit the next sequence at the target. It should close at the accepted ₹110 mark with ₹100 realised profit and reason `SIMULATED_TAKE_PROFIT`:
+
+```powershell
+$before = (Invoke-RestMethod "$base/api/trades" |
+  Where-Object trade_id -eq $tradeId | ConvertTo-Json -Compress)
+$stale = @{ trade_id = $tradeId; mark_price = 120; observation_sequence = 1 }
+try {
+  Invoke-RestMethod "$base/api/paper/mark" -Method Post `
+    -ContentType "application/json" -Body ($stale | ConvertTo-Json)
+} catch {
+  Write-Host "Expected stale-mark rejection: $($_.Exception.Message)"
+}
+$after = (Invoke-RestMethod "$base/api/trades" |
+  Where-Object trade_id -eq $tradeId | ConvertTo-Json -Compress)
+Write-Host "Ledger unchanged after rejected mark: $($before -eq $after)"
+
+$targetMark = @{ trade_id = $tradeId; mark_price = 110; observation_sequence = 2 }
+Invoke-RestMethod "$base/api/paper/mark" -Method Post `
+  -ContentType "application/json" -Body ($targetMark | ConvertTo-Json)
+Invoke-RestMethod "$base/api/trades" | ConvertTo-Json -Depth 5
+Invoke-RestMethod "$base/api/risk" | ConvertTo-Json
+Invoke-RestMethod "$base/api/events" | ConvertTo-Json -Depth 5
+```
+
+The dashboard's **Mark** action submits the next local sequence for a manually entered mark; **Close** remains available for manual paper closure. The API also permits an explicit sequence for testing. In the server window, stop and restart Uvicorn with Ctrl+C and the same `$env:AOTS_DATABASE_PATH`; refresh the dashboard or query `/api/trades` and `/api/events` to verify that the closed trade and audit history persisted. No broker order or live price monitoring is involved. Run `.\.venv\Scripts\pytest.exe -q` from the project root for the automated suite.
 
 ## Risk model notes
 

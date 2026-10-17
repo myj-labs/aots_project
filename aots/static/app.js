@@ -15,10 +15,15 @@ async function refresh() {
     $("capital").textContent = inr(status.capital_inr);
     $("pnl").textContent = inr(risk.daily_pnl);
     $("pnl").className = risk.daily_pnl >= 0 ? "positive" : "negative";
+    $("realised-pnl").textContent = inr(risk.realised_pnl);
+    $("realised-pnl").className = risk.realised_pnl >= 0 ? "positive" : "negative";
+    $("unrealised-pnl").textContent = inr(risk.unrealised_pnl);
+    $("unrealised-pnl").className = risk.unrealised_pnl >= 0 ? "positive" : "negative";
     $("positions-count").textContent = risk.open_positions;
     $("loss-limit").textContent = inr(risk.max_daily_loss_inr);
     $("trade-risk").textContent = `${(risk.max_trade_risk_pct*100).toFixed(2)}% · ${inr(risk.max_trade_risk_inr)}`;
     $("loss-streak").textContent = `${risk.consecutive_losses} / ${risk.max_consecutive_losses}`;
+    $("pause-status").textContent = risk.paused_for_day ? "Paused for today" : "Not paused";
     $("daily-pnl").textContent = inr(risk.daily_pnl);
     $("kill-status").textContent = risk.kill_switch ? "ON" : "OFF";
     $("risk-badge").textContent = risk.kill_switch ? "Entries blocked" : risk.paused_for_day ? "Paused" : "Active";
@@ -31,16 +36,31 @@ async function refresh() {
 }
 function renderTrades(trades) {
   const body = $("trades-body");
-  if(!trades.length){body.innerHTML='<tr><td colspan="8" class="muted">No paper trades yet. Create a simulated trade above to test the workflow.</td></tr>';return;}
+  if(!trades.length){body.innerHTML='<tr><td colspan="15" class="muted">No paper trades yet. Create a simulated trade above to test the workflow.</td></tr>';return;}
   body.innerHTML = trades.map(t => {
     const pnl = t.status==="OPEN" ? Number(t.unrealised_pnl) : Number(t.realised_pnl);
     const pnlClass = pnl >= 0 ? "positive" : "negative";
-    const status = t.close_reason==="SIMULATED_TAKE_PROFIT" ? "CLOSED · Take-profit reached" : t.status;
+    const status = t.close_reason==="SIMULATED_TAKE_PROFIT" ? "CLOSED · Take-profit reached" :
+      t.close_reason==="SIMULATED_STOP" ? "CLOSED · Stop-loss triggered" : t.status;
     const actions = t.status==="OPEN" ?
-      `<button data-action="mark" data-id="${t.trade_id}" data-sequence="${t.mark_sequence+1}">Mark</button><button data-action="close" data-id="${t.trade_id}">Close</button>` : "—";
+      `<button data-action="mark" data-id="${escapeHtml(t.trade_id)}" data-sequence="${Number(t.mark_sequence)+1}">Mark</button><button data-action="close" data-id="${escapeHtml(t.trade_id)}">Close</button>` : "—";
     const target = t.take_profit_profit_inr == null ? "—" : inr(t.take_profit_profit_inr);
-    return `<tr><td>${escapeHtml(t.symbol)}</td><td>${status}</td><td>${t.quantity} (${t.lots} lot)</td><td>${inr(t.entry_price)}</td><td>${target}</td><td>${inr(t.mark_price)}</td><td class="${pnlClass}">${inr(pnl)}</td><td>${actions}</td></tr>`;
+    const mark = t.status==="CLOSED" || Number(t.mark_sequence)>0 ? inr(t.mark_price) : "No mark submitted";
+    const pnlType = t.status==="OPEN" ? "Open unrealised" : "Closed realised";
+    const closeReason = {
+      SIMULATED_TAKE_PROFIT:"Take-profit reached",
+      SIMULATED_STOP:"Stop-loss triggered",
+      MANUAL:"Manual close",
+    }[t.close_reason] || t.close_reason || "—";
+    const side = t.side==="BUY" ? "BUY · Long" : t.side;
+    return `<tr><td>${escapeHtml(t.symbol)}</td><td>${escapeHtml(side)}</td><td>Not recorded</td><td>${escapeHtml(status)}</td><td>${inr(t.entry_price)}</td><td>${inr(t.stop_price)}</td><td>${target}</td><td>${mark}</td><td>${Number(t.quantity)}</td><td>${Number(t.lots)}</td><td class="${pnlClass}">${pnlType}<br>${inr(pnl)}</td><td>${kolkataTime(t.created_at)}</td><td>${kolkataTime(t.closed_at)}</td><td>${escapeHtml(closeReason)}</td><td>${actions}</td></tr>`;
   }).join("");
+}
+function kolkataTime(value){
+  if(!value)return "—";
+  const timestamp=new Date(value);
+  if(Number.isNaN(timestamp.getTime()))return "Unavailable";
+  return `${new Intl.DateTimeFormat("en-IN",{dateStyle:"medium",timeStyle:"short",timeZone:"Asia/Kolkata"}).format(timestamp)} IST`;
 }
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 $("refresh").addEventListener("click",refresh);
