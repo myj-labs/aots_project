@@ -31,13 +31,15 @@ async function refresh() {
 }
 function renderTrades(trades) {
   const body = $("trades-body");
-  if(!trades.length){body.innerHTML='<tr><td colspan="7" class="muted">No paper trades yet. Create a simulated trade above to test the workflow.</td></tr>';return;}
+  if(!trades.length){body.innerHTML='<tr><td colspan="8" class="muted">No paper trades yet. Create a simulated trade above to test the workflow.</td></tr>';return;}
   body.innerHTML = trades.map(t => {
     const pnl = t.status==="OPEN" ? Number(t.unrealised_pnl) : Number(t.realised_pnl);
     const pnlClass = pnl >= 0 ? "positive" : "negative";
+    const status = t.close_reason==="SIMULATED_TAKE_PROFIT" ? "CLOSED · Take-profit reached" : t.status;
     const actions = t.status==="OPEN" ?
       `<button data-action="mark" data-id="${t.trade_id}" data-sequence="${t.mark_sequence+1}">Mark</button><button data-action="close" data-id="${t.trade_id}">Close</button>` : "—";
-    return `<tr><td>${escapeHtml(t.symbol)}</td><td>${t.status}</td><td>${t.quantity} (${t.lots} lot)</td><td>${inr(t.entry_price)}</td><td>${inr(t.mark_price)}</td><td class="${pnlClass}">${inr(pnl)}</td><td>${actions}</td></tr>`;
+    const target = t.take_profit_profit_inr == null ? "—" : inr(t.take_profit_profit_inr);
+    return `<tr><td>${escapeHtml(t.symbol)}</td><td>${status}</td><td>${t.quantity} (${t.lots} lot)</td><td>${inr(t.entry_price)}</td><td>${target}</td><td>${inr(t.mark_price)}</td><td class="${pnlClass}">${inr(pnl)}</td><td>${actions}</td></tr>`;
   }).join("");
 }
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
@@ -51,6 +53,13 @@ $("trade-form").addEventListener("submit",async(e)=>{
   const form=e.currentTarget; const button=form.querySelector('button[type="submit"]');
   const f=new FormData(form); const data=Object.fromEntries(f.entries());
   ["entry_price","stop_price","quantity","lots","market_data_age_seconds"].forEach(k=>data[k]=Number(data[k]));
+  const target = data.take_profit_profit_inr.trim();
+  data.take_profit_profit_inr = target ? Number(target) : null;
+  if(data.take_profit_profit_inr !== null && (!Number.isFinite(data.take_profit_profit_inr) || data.take_profit_profit_inr <= 0)){
+    $("form-message").textContent="Take-profit profit target must be a positive rupee amount.";
+    $("form-message").className="negative";
+    return;
+  }
   pendingEntryKey ||= crypto.randomUUID();
   data.idempotency_key=pendingEntryKey;
   entryRequestActive=true; button.disabled=true;

@@ -1,6 +1,25 @@
+import json
+import os
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 from fastapi.testclient import TestClient
+
+# The API module constructs its database at import time. Keep that initialization
+# isolated too; API integration tests install their own per-test database below.
+_import_database_dir = tempfile.TemporaryDirectory(prefix="aots-api-import-")
+_original_database_path = os.environ.get("AOTS_DATABASE_PATH")
+os.environ["AOTS_DATABASE_PATH"] = str(
+    Path(_import_database_dir.name) / "aots.db"
+)
 from aots import api
 from aots.api import app
+from aots.database import Database
+from aots.paper import PaperBroker
+from aots.risk import RiskEngine
 
 
 def test_health_is_paper_only():
@@ -65,3 +84,436 @@ def test_mark_endpoint_maps_stale_sequence_to_conflict(monkeypatch):
     assert response.status_code == 409
     assert "stale or duplicate" in response.json()["detail"]
     assert received == [("test", 100, 2)]
+
+
+@pytest.fixture
+def paper_api(tmp_path, monkeypatch):
+    settings = SimpleNamespace(
+        app_name="AOTS API test",
+        environment="test",
+        broker="broker-independent",
+        trading_mode="paper",
+        underlying="NIFTY",
+        capital_inr=100_000,
+        max_daily_loss_pct=.02,
+        max_trade_risk_pct=.005,
+        max_consecutive_losses=3,
+        max_open_positions=3,
+        max_lots_per_order=1,
+        market_data_max_age_seconds=5,
+        database_path=str(tmp_path / "api-test.db"),
+    )
+    fixed_time = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    db = Database(settings.database_path)
+    risk = RiskEngine(settings, db, clock=lambda: fixed_time)
+    paper = PaperBroker(settings, db, risk)
+    monkeypatch.setattr(api, "settings", settings)
+    monkeypatch.setattr(api, "db", db)
+    monkeypatch.setattr(api, "risk", risk)
+    monkeypatch.setattr(api, "paper", paper)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        yield client, settings, db, risk
+
+
+def trade_payload(key="api-trade"):
+    return {
+        "symbol": "NIFTY-DEMO-CE",
+        "idempotency_key": key,
+        "side": "BUY",
+        "entry_price": 100,
+        "stop_price": 95,
+        "quantity": 10,
+        "lots": 1,
+        "market_data_age_seconds": 0,
+    }
+
+
+def decoded_events(client):
+    return [
+        {
+            **event,
+            "detail": json.loads(event["detail_json"]),
+        }
+        for event in client.get("/api/events").json()
+    ]
+
+
+def test_api_paper_lifecycle_observation_rejection_stop_and_closed_state(paper_api):
+    client, _, db, _ = paper_api
+    created = client.post("/api/paper/trade", json=trade_payload())
+    assert created.status_code == 200
+    trade = created.json()
+    trade_id = trade["trade_id"]
+    assert trade["status"] == "OPEN"
+    assert trade["mark_sequence"] == 0
+    assert client.get("/api/positions").json()[0]["trade_id"] == trade_id
+    assert client.get("/api/risk").json()["open_positions"] == 1
+
+    accepted = client.post(
+        "/api/paper/mark",
+        json={
+            "trade_id": trade_id,
+            "mark_price": 110,
+            "observation_sequence": 2,
+        },
+    )
+    assert accepted.status_code == 200
+    marked = accepted.json()
+    assert marked["mark_price"] == 110
+    assert marked["unrealised_pnl"] == 100
+    assert marked["mark_sequence"] == 2
+    risk_before_rejections = client.get("/api/risk").json()
+    events_before_rejections = decoded_events(client)
+    trades_before_rejections = client.get("/api/trades").json()
+
+    for sequence in (2, 1):
+        rejected = client.post(
+            "/api/paper/mark",
+            json={
+                "trade_id": trade_id,
+                "mark_price": 90,
+                "observation_sequence": sequence,
+            },
+        )
+        assert rejected.status_code == 409
+        assert "stale or duplicate" in rejected.json()["detail"]
+        assert client.get("/api/trades").json() == trades_before_rejections
+        assert client.get("/api/risk").json() == risk_before_rejections
+        assert decoded_events(client) == events_before_rejections
+        assert db.trades()[0]["status"] == "OPEN"
+
+    stale_stop = client.post(
+        "/api/paper/mark",
+        json={
+            "trade_id": trade_id,
+            "mark_price": 90,
+            "observation_sequence": 1,
+        },
+    )
+    assert stale_stop.status_code == 409
+    assert db.trades()[0]["status"] == "OPEN"
+    assert client.get("/api/risk").json() == risk_before_rejections
+
+    stopped = client.post(
+        "/api/paper/mark",
+        json={
+            "trade_id": trade_id,
+            "mark_price": 90,
+            "observation_sequence": 3,
+        },
+    )
+    assert stopped.status_code == 200
+    closed = stopped.json()
+    assert closed["status"] == "CLOSED"
+    assert closed["mark_price"] == 90
+    assert closed["mark_sequence"] == 3
+    assert closed["realised_pnl"] == -100
+    assert closed["unrealised_pnl"] == 0
+
+    risk_after_stop = client.get("/api/risk").json()
+    assert risk_after_stop["realised_pnl"] == -100
+    assert risk_after_stop["unrealised_pnl"] == 0
+    assert risk_after_stop["daily_pnl"] == -100
+    assert risk_after_stop["open_positions"] == 0
+    assert client.get("/api/positions").json() == []
+
+    events = decoded_events(client)
+    mark_events = [e for e in events if e["event_type"] == "PAPER_TRADE_MARKED"]
+    close_events = [e for e in events if e["event_type"] == "PAPER_TRADE_CLOSED"]
+    assert len(mark_events) == 2
+    assert len(close_events) == 1
+    stop_mark = next(e for e in mark_events if e["detail"]["observation_sequence"] == 3)
+    assert stop_mark["detail"]["unrealised_pnl"] == 0
+    assert close_events[0]["detail"]["pnl"] == -100
+    assert close_events[0]["detail"]["reason"] == "SIMULATED_STOP"
+
+    closed_trade_before = client.get("/api/trades").json()
+    events_before_closed_mark = decoded_events(client)
+    after_close = client.post(
+        "/api/paper/mark",
+        json={
+            "trade_id": trade_id,
+            "mark_price": 120,
+            "observation_sequence": 4,
+        },
+    )
+    assert after_close.status_code == 409
+    assert client.get("/api/trades").json() == closed_trade_before
+    assert decoded_events(client) == events_before_closed_mark
+    assert client.get("/api/risk").json() == risk_after_stop
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"trade_id": "missing-sequence", "mark_price": 100},
+        {"trade_id": "zero-sequence", "mark_price": 100, "observation_sequence": 0},
+        {"trade_id": "fractional-sequence", "mark_price": 100, "observation_sequence": 1.5},
+        {"trade_id": "boolean-sequence", "mark_price": 100, "observation_sequence": True},
+        {
+            **trade_payload("invalid-stop"),
+            "stop_price": 100,
+        },
+        {
+            **trade_payload("target-at-entry"),
+            "take_profit_profit_inr": 0,
+        },
+        {
+            **trade_payload("target-below-entry"),
+            "take_profit_profit_inr": -1,
+        },
+    ],
+)
+def test_api_validation_errors_leave_isolated_ledger_unchanged(paper_api, payload):
+    client, _, db, risk = paper_api
+    initial_events = decoded_events(client)
+    initial_risk = risk.snapshot()
+
+    if "idempotency_key" in payload:
+        response = client.post("/api/paper/trade", json=payload)
+    else:
+        response = client.post("/api/paper/mark", json=payload)
+
+    assert response.status_code == 422
+    assert db.trades() == []
+    assert decoded_events(client) == initial_events
+    assert risk.snapshot() == initial_risk
+
+
+def test_api_sqlite_reinitialization_restores_trade_risk_and_kill_switch(
+    paper_api, monkeypatch
+):
+    client, settings, db, _ = paper_api
+    created = client.post("/api/paper/trade", json=trade_payload("restart"))
+    trade_id = created.json()["trade_id"]
+    marked = client.post(
+        "/api/paper/mark",
+        json={
+            "trade_id": trade_id,
+            "mark_price": 105,
+            "observation_sequence": 4,
+        },
+    )
+    assert marked.status_code == 200
+    switched = client.post("/api/risk/kill-switch", json={"enabled": True})
+    assert switched.status_code == 200
+
+    reopened_db = Database(db.path)
+    reopened_risk = RiskEngine(
+        settings,
+        reopened_db,
+        clock=lambda: datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(api, "db", reopened_db)
+    monkeypatch.setattr(api, "risk", reopened_risk)
+    monkeypatch.setattr(api, "paper", PaperBroker(settings, reopened_db, reopened_risk))
+
+    persisted = client.get("/api/trades")
+    assert persisted.status_code == 200
+    assert persisted.json()[0]["trade_id"] == trade_id
+    assert persisted.json()[0]["mark_sequence"] == 4
+    assert persisted.json()[0]["unrealised_pnl"] == 50
+    assert client.get("/api/risk").json()["unrealised_pnl"] == 50
+    assert client.get("/api/risk").json()["kill_switch"] is True
+    assert any(
+        event["event_type"] == "PAPER_TRADE_MARKED"
+        for event in client.get("/api/events").json()
+    )
+
+
+def test_api_take_profit_persists_and_closes_with_observed_mark(paper_api, monkeypatch):
+    client, settings, db, _ = paper_api
+    payload = {
+        **trade_payload("api-take-profit"),
+        "quantity": 65,
+        "take_profit_profit_inr": 650,
+    }
+    created = client.post("/api/paper/trade", json=payload)
+    assert created.status_code == 200
+    trade_id = created.json()["trade_id"]
+    assert created.json()["take_profit_profit_inr"] == 650
+
+    reopened_db = Database(db.path)
+    reopened_risk = RiskEngine(
+        settings,
+        reopened_db,
+        clock=lambda: datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(api, "db", reopened_db)
+    monkeypatch.setattr(api, "risk", reopened_risk)
+    monkeypatch.setattr(api, "paper", PaperBroker(settings, reopened_db, reopened_risk))
+
+    under_target = client.post(
+        "/api/paper/mark",
+        json={
+            "trade_id": trade_id,
+            "mark_price": 109,
+            "observation_sequence": 1,
+        },
+    )
+    assert under_target.status_code == 200
+    assert under_target.json()["status"] == "OPEN"
+    assert under_target.json()["unrealised_pnl"] == 585
+    before_stale_trades = client.get("/api/trades").json()
+    before_stale_risk = client.get("/api/risk").json()
+    before_stale_events = decoded_events(client)
+
+    stale_target = client.post(
+        "/api/paper/mark",
+        json={
+            "trade_id": trade_id,
+            "mark_price": 120,
+            "observation_sequence": 1,
+        },
+    )
+    assert stale_target.status_code == 409
+    assert client.get("/api/trades").json() == before_stale_trades
+    assert client.get("/api/risk").json() == before_stale_risk
+    assert decoded_events(client) == before_stale_events
+
+    target_hit = client.post(
+        "/api/paper/mark",
+        json={
+            "trade_id": trade_id,
+            "mark_price": 110,
+            "observation_sequence": 2,
+        },
+    )
+    assert target_hit.status_code == 200
+    closed = target_hit.json()
+    assert closed["status"] == "CLOSED"
+    assert closed["take_profit_profit_inr"] == 650
+    assert closed["mark_price"] == 110
+    assert closed["close_reason"] == "SIMULATED_TAKE_PROFIT"
+    assert closed["realised_pnl"] == 650
+    assert closed["unrealised_pnl"] == 0
+    assert client.get("/api/trades").json()[0]["close_reason"] == (
+        "SIMULATED_TAKE_PROFIT"
+    )
+    assert client.get("/api/positions").json() == []
+    assert client.get("/api/risk").json()["realised_pnl"] == 650
+
+    closed_again = client.post(
+        "/api/paper/mark",
+        json={
+            "trade_id": trade_id,
+            "mark_price": 130,
+            "observation_sequence": 3,
+        },
+    )
+    assert closed_again.status_code == 409
+    assert reopened_db.trades()[0]["realised_pnl"] == 650
+    close_events = [
+        event for event in decoded_events(client)
+        if event["event_type"] == "PAPER_TRADE_CLOSED"
+    ]
+    assert len(close_events) == 1
+    assert close_events[0]["detail"]["exit_price"] == 110
+    assert close_events[0]["detail"]["reason"] == "SIMULATED_TAKE_PROFIT"
+
+
+def test_api_invalid_mark_sequences_cannot_trigger_take_profit(paper_api):
+    client, _, db, _ = paper_api
+    created = client.post(
+        "/api/paper/trade",
+        json={
+            **trade_payload("invalid-sequence-target"),
+            "take_profit_profit_inr": 50,
+        },
+    )
+    trade_id = created.json()["trade_id"]
+    accepted = client.post(
+        "/api/paper/mark",
+        json={
+            "trade_id": trade_id,
+            "mark_price": 101,
+            "observation_sequence": 2,
+        },
+    )
+    assert accepted.status_code == 200
+    before_trade = db.trades()[0]
+    before_risk = client.get("/api/risk").json()
+    before_events = decoded_events(client)
+
+    invalid_sequences = (None, 0, 2.5, True)
+    for sequence in invalid_sequences:
+        payload = {"trade_id": trade_id, "mark_price": 110}
+        if sequence is not None:
+            payload["observation_sequence"] = sequence
+        response = client.post("/api/paper/mark", json=payload)
+        assert response.status_code == 422
+        assert db.trades()[0] == before_trade
+        assert client.get("/api/risk").json() == before_risk
+        assert decoded_events(client) == before_events
+
+
+@pytest.mark.parametrize("failed_event", ["PAPER_TRADE_MARKED", "PAPER_TRADE_CLOSED"])
+def test_api_take_profit_persistence_failure_rolls_back_everything(
+    paper_api, monkeypatch, failed_event
+):
+    client, _, db, risk = paper_api
+    created = client.post(
+        "/api/paper/trade",
+        json={
+            **trade_payload("take-profit-rollback"),
+            "quantity": 65,
+            "take_profit_profit_inr": 650,
+        },
+    )
+    trade_id = created.json()["trade_id"]
+    before_risk = client.get("/api/risk").json()
+    before_events = decoded_events(client)
+    original_event = db.event
+
+    def fail_event(event_type, detail, conn=None):
+        if event_type == failed_event:
+            raise OSError("simulated event persistence failure")
+        return original_event(event_type, detail, conn=conn)
+
+    monkeypatch.setattr(db, "event", fail_event)
+    response = client.post(
+        "/api/paper/mark",
+        json={
+            "trade_id": trade_id,
+            "mark_price": 110,
+            "observation_sequence": 1,
+        },
+    )
+    assert response.status_code == 500
+
+    persisted = db.trades()[0]
+    assert persisted["status"] == "OPEN"
+    assert persisted["mark_price"] == 100
+    assert persisted["mark_sequence"] == 0
+    assert persisted["realised_pnl"] == 0
+    assert persisted["unrealised_pnl"] == 0
+    assert client.get("/api/risk").json() == before_risk
+    assert decoded_events(client) == before_events
+    assert risk.get_consecutive_losses() == 0
+
+
+def test_dashboard_serves_trade_controls_and_sequence_aware_script(paper_api):
+    client, _, _, _ = paper_api
+    page = client.get("/")
+    script = client.get("/static/app.js")
+
+    assert page.status_code == 200
+    assert 'id="trade-form"' in page.text
+    assert 'id="trades-body"' in page.text
+    assert script.status_code == 200
+    assert 'data-sequence="${t.mark_sequence+1}"' in script.text
+    assert 'observation_sequence:Number(b.dataset.sequence)' in script.text
+    assert 'name="take_profit_profit_inr"' in page.text
+    assert "Total quantity (all lots)" in page.text
+    assert 't.close_reason==="SIMULATED_TAKE_PROFIT"' in script.text
+    assert 'const target = data.take_profit_profit_inr.trim();' in script.text
+    assert 'api("/api/paper/mark"' in script.text
+
+
+def teardown_module():
+    if _original_database_path is None:
+        os.environ.pop("AOTS_DATABASE_PATH", None)
+    else:
+        os.environ["AOTS_DATABASE_PATH"] = _original_database_path
+    _import_database_dir.cleanup()

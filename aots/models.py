@@ -13,6 +13,9 @@ class PaperTradeRequest(BaseModel):
     side: Literal["BUY"] = "BUY"
     entry_price: float = Field(gt=0)
     stop_price: float = Field(gt=0)
+    take_profit_profit_inr: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False
+    )
     quantity: int = Field(gt=0)
     lots: int = Field(default=1, ge=1)
     market_data_age_seconds: float = Field(ge=0, allow_inf_nan=False)
@@ -55,6 +58,7 @@ class PaperTrade(BaseModel):
     side: str
     entry_price: float
     stop_price: float
+    take_profit_profit_inr: float | None = None
     mark_price: float
     quantity: int
     lots: int
@@ -62,5 +66,6 @@ class PaperTrade(BaseModel):
     realised_pnl: float = 0
     unrealised_pnl: float = 0
     mark_sequence: int = 0
+    close_reason: str | None = None
     created_at: datetime
     closed_at: datetime | None = None

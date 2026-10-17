@@ -82,6 +82,19 @@ Paper-entry requests require a unique `idempotency_key` and an explicit finite `
 
 Paper mark requests require a positive `observation_sequence` that strictly increases per trade. Missing or malformed sequences return HTTP 422; a duplicate or lower sequence is rejected with HTTP 409 without recording an applied-mark event. The check, accepted mark, simulated-stop behavior, P&L, and audit events are applied atomically. The dashboard supplies the next local sequence for manual simulated marks. Since the application has no connected feed, callers must supply source-generated monotonic sequences to represent source observation order; server receipt order does not establish freshness. Existing SQLite trades are retained and migrated with `mark_sequence=0`.
 
+Paper entries may optionally include `take_profit_profit_inr`, a positive rupee-denominated total P&L target. P&L uses `(mark - entry) * quantity`, where `quantity` is the total option units across all lots; `lots` is not multiplied in again. For 10 lots of 65 units, submit `quantity=650, lots=10`. At an entry premium of ₹100, a ₹1,500 target is reached at or above a mark of ₹102.31 (₹1,501.50 profit). The trade closes at the accepted observed mark and records `SIMULATED_TAKE_PROFIT`; it does not assume a fill at a different price. This starter does not maintain an instrument lot-size master, so callers must supply the correct total quantity. The existing stop rule remains `mark_price <= stop_price` and is checked first. Trades without a target retain their existing stop/manual-close behavior. Existing databases are migrated additively with a nullable target and closure-reason column. A legacy `take_profit_price` premium column is preserved as-is but is not copied to the rupee target; the new target remains disabled for those records unless explicitly set.
+
+### Dashboard manual smoke check
+
+Automated tests verify that the dashboard and its sequence-aware script are served, but do not automate browser interaction. To exercise the UI against an isolated temporary ledger from the project root in Windows PowerShell:
+
+```powershell
+$env:AOTS_DATABASE_PATH = Join-Path $env:TEMP ("aots-sprint4-" + [guid]::NewGuid().ToString() + ".db")
+.\.venv\Scripts\python.exe -m uvicorn aots.api:app --reload
+```
+
+Open http://127.0.0.1:8000 and create a trade with entry `100`, stop `95`, total quantity `65`, and take-profit profit target `650`. Mark it at `105` and confirm it remains open with unrealised P&L of ₹325; mark it at `110` and confirm it closes at the observed mark with ₹650 realised P&L and a “Take-profit reached” status. Create a second trade with take-profit blank, mark it at `90`, and confirm the existing simulated stop closes it with -₹650 realised P&L. Reload the page and confirm both closed trades remain in the ledger. These are manual paper-only checks; no broker order is sent.
+
 ## Risk model notes
 
 - The daily-loss limit is calculated against the configured starting capital and current-date realised + open-position unrealised P&L tracked by this local paper ledger. Trade closing dates use Asia/Kolkata.
