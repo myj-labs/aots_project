@@ -105,7 +105,9 @@ def open_paper_trade(req: PaperTradeRequest):
 @app.post("/api/paper/mark")
 def mark_paper_trade(req: MarkPriceRequest):
     try:
-        result = paper.mark(req.trade_id, req.mark_price)
+        result = paper.mark(
+            req.trade_id, req.mark_price, req.observation_sequence
+        )
         return result.model_dump(mode="json")
     except KeyError:
         raise HTTPException(status_code=404, detail="Trade not found.")

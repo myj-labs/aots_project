@@ -36,6 +36,7 @@ class Database:
               status TEXT NOT NULL,
               realised_pnl REAL NOT NULL DEFAULT 0,
               unrealised_pnl REAL NOT NULL DEFAULT 0,
+              mark_sequence INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL,
               closed_at TEXT
             );
@@ -60,6 +61,10 @@ class Database:
                     CREATE UNIQUE INDEX IF NOT EXISTS
                     idx_trades_idempotency_key ON trades(idempotency_key)
                     """
+                )
+            if "mark_sequence" not in columns:
+                conn.execute(
+                    "ALTER TABLE trades ADD COLUMN mark_sequence INTEGER NOT NULL DEFAULT 0"
                 )
 
     def event(self, event_type: str, detail: dict[str, Any], conn=None):
@@ -186,10 +191,14 @@ class Database:
             return
         conn.execute("""
             INSERT INTO trades(trade_id,idempotency_key,symbol,side,entry_price,stop_price,mark_price,
-              quantity,lots,status,realised_pnl,unrealised_pnl,created_at,closed_at)
+              quantity,lots,status,realised_pnl,unrealised_pnl,mark_sequence,created_at,closed_at)
             VALUES (:trade_id,:idempotency_key,:symbol,:side,:entry_price,:stop_price,:mark_price,
-              :quantity,:lots,:status,:realised_pnl,:unrealised_pnl,:created_at,:closed_at)
-        """, {**trade, "idempotency_key": trade.get("idempotency_key")})
+              :quantity,:lots,:status,:realised_pnl,:unrealised_pnl,:mark_sequence,:created_at,:closed_at)
+        """, {
+            **trade,
+            "idempotency_key": trade.get("idempotency_key"),
+            "mark_sequence": trade.get("mark_sequence", 0),
+        })
 
     def insert_trade_atomically(
         self,
@@ -257,9 +266,10 @@ class Database:
         with self.connect() as conn:
             conn.execute("""
                 UPDATE trades SET mark_price=:mark_price,status=:status,
-                  realised_pnl=:realised_pnl,unrealised_pnl=:unrealised_pnl,closed_at=:closed_at
+                  realised_pnl=:realised_pnl,unrealised_pnl=:unrealised_pnl,
+                mark_sequence=COALESCE(:mark_sequence,mark_sequence),closed_at=:closed_at
                 WHERE trade_id=:trade_id
-            """, trade)
+                """, {**trade, "mark_sequence": trade.get("mark_sequence")})
 
     def transition_open_trade(self, trade_id: str, prepare_transition, after_transition):
         """Read, prepare, persist, and audit one open-trade transition atomically."""
@@ -277,7 +287,7 @@ class Database:
                 """
                 UPDATE trades SET mark_price=:mark_price,status=:status,
                   realised_pnl=:realised_pnl,unrealised_pnl=:unrealised_pnl,
-                  closed_at=:closed_at
+                  mark_sequence=:mark_sequence,closed_at=:closed_at
                 WHERE trade_id=:trade_id AND status='OPEN'
                 """,
                 trade,

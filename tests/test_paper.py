@@ -40,7 +40,7 @@ def test_paper_trade_open_mark_close_lifecycle_uses_long_option_pnl(tmp_path):
     request = paper_request()
 
     opened = broker.open_trade(request)
-    marked = broker.mark(opened.trade_id, 110)
+    marked = broker.mark(opened.trade_id, 110, observation_sequence=1)
     assert marked.unrealised_pnl == 100
     assert risk.snapshot().unrealised_pnl == 100
 
@@ -65,7 +65,7 @@ def test_stop_trigger_mark_event_matches_persisted_closed_trade(tmp_path):
     broker = PaperBroker(settings, db, risk)
     opened = broker.open_trade(paper_request())
 
-    closed = broker.mark(opened.trade_id, 90)
+    closed = broker.mark(opened.trade_id, 90, observation_sequence=1)
 
     persisted = next(t for t in db.trades() if t["trade_id"] == opened.trade_id)
     events = list(reversed(db.events()))
@@ -78,36 +78,44 @@ def test_stop_trigger_mark_event_matches_persisted_closed_trade(tmp_path):
     assert persisted["status"] == "CLOSED"
     assert persisted["unrealised_pnl"] == 0
     assert persisted["realised_pnl"] == -100
+    assert persisted["mark_sequence"] == 1
     assert marked_detail["unrealised_pnl"] == 0
+    assert marked_detail["observation_sequence"] == 1
     assert closed_detail["pnl"] == -100
     assert closed_detail["reason"] == "SIMULATED_STOP"
 
 
-def test_concurrent_marks_read_the_latest_committed_trade_state(tmp_path, monkeypatch):
+def test_concurrent_out_of_order_marks_keep_newest_sequence(tmp_path, monkeypatch):
     settings, db, risk = make_paper_services(tmp_path)
     broker = PaperBroker(settings, db, risk)
     opened = broker.open_trade(paper_request())
     original_transition = db.transition_open_trade
-    start_barrier = Barrier(2)
-    initial_marks = []
+    older_started = Event()
+    newer_committed = Event()
+    call_lock = Lock()
+    call_count = 0
 
     def synchronized_transition(trade_id, prepare_transition, after_transition):
-        start_barrier.wait()
-
-        def capture_current_state(trade):
-            initial_marks.append(trade["mark_price"])
-            return prepare_transition(trade)
-
-        return original_transition(
-            trade_id, capture_current_state, after_transition
-        )
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+            call_number = call_count
+        if call_number == 1:
+            older_started.set()
+            assert newer_committed.wait(timeout=5)
+            return original_transition(trade_id, prepare_transition, after_transition)
+        result = original_transition(trade_id, prepare_transition, after_transition)
+        newer_committed.set()
+        return result
 
     monkeypatch.setattr(db, "transition_open_trade", synchronized_transition)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(
-            lambda mark: broker.mark(opened.trade_id, mark),
-            (110, 120),
-        ))
+        older = pool.submit(broker.mark, opened.trade_id, 110, 1)
+        assert older_started.wait(timeout=5)
+        newer = pool.submit(broker.mark, opened.trade_id, 120, 2)
+        with pytest.raises(ValueError, match="stale or duplicate"):
+            older.result(timeout=5)
+        newer_result = newer.result(timeout=5)
 
     persisted = db.trades()[0]
     mark_events = [
@@ -115,11 +123,97 @@ def test_concurrent_marks_read_the_latest_committed_trade_state(tmp_path, monkey
         for event in reversed(db.events())
         if event["event_type"] == "PAPER_TRADE_MARKED"
     ]
-    assert sorted(initial_marks) == [100, 110] or sorted(initial_marks) == [100, 120]
-    assert len(mark_events) == 2
-    assert persisted["mark_price"] == mark_events[-1]["mark_price"]
-    assert persisted["unrealised_pnl"] == mark_events[-1]["unrealised_pnl"]
-    assert {result.mark_price for result in results} == {110, 120}
+    assert len(mark_events) == 1
+    assert persisted["mark_sequence"] == 2
+    assert persisted["mark_price"] == mark_events[-1]["mark_price"] == 120
+    assert persisted["unrealised_pnl"] == mark_events[-1]["unrealised_pnl"] == 200
+    assert mark_events[-1]["observation_sequence"] == 2
+    assert newer_result.mark_price == 120
+
+
+def test_chronological_mark_sequences_update_mark_and_pnl(tmp_path):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(paper_request())
+
+    first = broker.mark(opened.trade_id, 110, observation_sequence=1)
+    second = broker.mark(opened.trade_id, 115, observation_sequence=2)
+
+    assert first.unrealised_pnl == 100
+    assert first.mark_sequence == 1
+    assert second.mark_price == 115
+    assert second.unrealised_pnl == 150
+    assert second.mark_sequence == 2
+
+
+def test_older_and_duplicate_mark_sequences_are_rejected_without_audit(tmp_path):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(paper_request())
+    broker.mark(opened.trade_id, 110, observation_sequence=2)
+    event_count = sum(
+        event["event_type"] == "PAPER_TRADE_MARKED" for event in db.events()
+    )
+
+    for sequence in (1, 2):
+        with pytest.raises(ValueError, match="stale or duplicate"):
+            broker.mark(opened.trade_id, 90, observation_sequence=sequence)
+
+    persisted = db.trades()[0]
+    assert persisted["mark_sequence"] == 2
+    assert persisted["mark_price"] == 110
+    assert persisted["unrealised_pnl"] == 100
+    assert persisted["status"] == "OPEN"
+    assert sum(
+        event["event_type"] == "PAPER_TRADE_MARKED" for event in db.events()
+    ) == event_count
+
+
+def test_stale_below_stop_mark_cannot_close_after_newer_above_stop_mark(tmp_path):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(paper_request())
+    broker.mark(opened.trade_id, 110, observation_sequence=2)
+
+    with pytest.raises(ValueError, match="stale or duplicate"):
+        broker.mark(opened.trade_id, 90, observation_sequence=1)
+
+    open_trade = db.trades()[0]
+    assert open_trade["status"] == "OPEN"
+    assert open_trade["mark_price"] == 110
+    assert open_trade["unrealised_pnl"] == 100
+    assert open_trade["mark_sequence"] == 2
+
+    closed = broker.mark(opened.trade_id, 90, observation_sequence=3)
+    events = [
+        json.loads(event["detail_json"])
+        for event in reversed(db.events())
+        if event["event_type"] in {"PAPER_TRADE_MARKED", "PAPER_TRADE_CLOSED"}
+    ]
+    assert closed.status == "CLOSED"
+    assert closed.realised_pnl == -100
+    assert closed.unrealised_pnl == 0
+    assert closed.mark_sequence == 3
+    assert [event["event_type"] for event in reversed(db.events())].count(
+        "PAPER_TRADE_CLOSED"
+    ) == 1
+    assert events[-2]["observation_sequence"] == 3
+
+
+def test_mark_after_close_does_not_change_closed_trade(tmp_path):
+    settings, db, risk = make_paper_services(tmp_path)
+    broker = PaperBroker(settings, db, risk)
+    opened = broker.open_trade(paper_request())
+    closed = broker.close_trade(opened.trade_id, exit_price=90)
+    before_events = db.events()
+
+    with pytest.raises(ValueError, match="not open"):
+        broker.mark(opened.trade_id, 110, observation_sequence=1)
+
+    assert db.trades()[0]["status"] == "CLOSED"
+    assert db.trades()[0]["realised_pnl"] == closed.realised_pnl == -100
+    assert db.trades()[0]["mark_price"] == 90
+    assert db.events() == before_events
 
 
 def test_stop_mark_wins_atomic_race_against_mark_after_close(tmp_path, monkeypatch):
@@ -155,9 +249,9 @@ def test_stop_mark_wins_atomic_race_against_mark_after_close(tmp_path, monkeypat
     monkeypatch.setattr(db, "transition_open_trade", signal_mark_started)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        stop_future = pool.submit(broker.mark, opened.trade_id, 90)
+        stop_future = pool.submit(broker.mark, opened.trade_id, 90, 1)
         assert stop_mark_recorded.wait(timeout=5)
-        later_mark_future = pool.submit(broker.mark, opened.trade_id, 110)
+        later_mark_future = pool.submit(broker.mark, opened.trade_id, 110, 2)
         assert later_mark_started.wait(timeout=5)
         release_stop.set()
         stopped_trade = stop_future.result(timeout=5)
@@ -192,13 +286,14 @@ def test_stop_mark_audit_failure_rolls_back_complete_transition(
     monkeypatch.setattr(db, "event", fail_stop_audit)
 
     with pytest.raises(OSError, match="persistence failure"):
-        broker.mark(opened.trade_id, 90)
+        broker.mark(opened.trade_id, 90, observation_sequence=1)
 
     persisted = db.trades()[0]
     assert persisted["status"] == "OPEN"
     assert persisted["mark_price"] == 100
     assert persisted["realised_pnl"] == 0
     assert persisted["unrealised_pnl"] == 0
+    assert persisted["mark_sequence"] == 0
     assert risk.get_consecutive_losses() == 0
     assert not any(
         event["event_type"] in {"PAPER_TRADE_MARKED", "PAPER_TRADE_CLOSED"}
@@ -470,7 +565,8 @@ def test_database_migration_preserves_legacy_trade_rows(tmp_path):
     assert db.trades()[0]["trade_id"] == "legacy"
     with db.connect() as conn:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
-    assert "idempotency_key" in columns
+    assert {"idempotency_key", "mark_sequence"} <= columns
+    assert db.trades()[0]["mark_sequence"] == 0
 
 
 def test_daily_pause_event_failure_rolls_back_close_and_pause(tmp_path, monkeypatch):
