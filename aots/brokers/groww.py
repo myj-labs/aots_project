@@ -240,7 +240,7 @@ class GrowwRuntimeConnection:
             status != 200
             or not isinstance(token, str)
             or not _TOKEN_RE.match(token)
-            or data.get("isActive", True) is not True
+            or data.get("isActive") is not True
         ):
             raise ProviderResponseError()
         self._token = token
@@ -266,6 +266,14 @@ class GrowwRuntimeConnection:
             raise
         except Exception:
             raise ProviderUnavailableError() from None
+        error = data.get("error") if isinstance(data, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        if code == "GA005":
+            raise ProviderAuthError(
+                "Groww rejected the credentials."
+                if auth
+                else "Groww rejected the access token (invalid or expired); reconnect."
+            )
         if status in (401, 403):
             raise ProviderAuthError(
                 "Groww rejected the credentials." if auth

@@ -197,6 +197,26 @@ def test_connect_rejects_malformed_auth_response(provider_env):
     assert body["state"] == "failed" and body["configured"] is False
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"token": "tok-12345678"},
+        {"token": "tok-12345678", "isActive": False},
+    ],
+)
+def test_token_response_requires_explicit_active_flag(provider_env, response):
+    mgr, _, _ = groww_manager_with_transport(
+        [datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)],
+        responses=[(200, response)],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        body = client.post("/api/provider/connect", json=APPROVAL).json()
+    assert body["state"] == "failed"
+    assert body["connected"] is False
+    assert body["configured"] is False
+
+
 def test_status_exposes_only_non_sensitive_metadata(provider_env):
     with TestClient(app) as client:
         client.post("/api/provider/connect", json=TOTP)
@@ -333,6 +353,78 @@ def test_provider_market_data_handles_upstream_failure(provider_env):
         client.post("/api/provider/connect", json=APPROVAL)
         res = client.get("/api/provider/quote?symbol=NIFTY")
     assert res.status_code == 503
+
+
+def test_provider_market_data_auth_error_code_fails_session_safely(provider_env, caplog):
+    caplog.set_level(logging.DEBUG)
+    now = datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)
+    mgr, created, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678", "isActive": True}),
+            (
+                400,
+                {
+                    "status": "FAILURE",
+                    "error": {
+                        "code": "GA005",
+                        "message": f"Rejected credential {MARKER}",
+                        "metadata": None,
+                    },
+                },
+            ),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        assert client.post("/api/provider/connect", json=APPROVAL).json()["state"] == "connected"
+        response = client.get("/api/provider/quote?symbol=NIFTY")
+        state = client.get("/api/provider/status").json()
+        second_request = client.get("/api/provider/quote?symbol=NIFTY")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == (
+        "Groww rejected the access token (invalid or expired); reconnect."
+    )
+    assert state["state"] == "failed"
+    assert state["connected"] is False and state["configured"] is False
+    assert mgr._connection is None
+    assert created[0]._token is None and created[0]._expires_at is None
+    assert second_request.status_code == 409
+    for text in (response.text, caplog.text, second_request.text):
+        assert MARKER not in text
+        assert "tok-12345678" not in text
+
+
+def test_ordinary_upstream_bad_request_keeps_session_connected(provider_env):
+    now = datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)
+    mgr, created, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678", "isActive": True}),
+            (
+                400,
+                {
+                    "status": "FAILURE",
+                    "error": {
+                        "code": "GA001",
+                        "message": "Invalid trading symbol.",
+                        "metadata": None,
+                    },
+                },
+            ),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        assert client.post("/api/provider/connect", json=APPROVAL).json()["state"] == "connected"
+        response = client.get("/api/provider/quote?symbol=NIFTY")
+        status = client.get("/api/provider/status").json()
+        assert status["state"] == "connected" and status["configured"] is True
+        assert mgr._connection is created[0]
+        assert created[0]._token == "tok-12345678"
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Groww rejected the request; check the symbol and expiry."
 
 
 def test_expired_token_fails_safely_and_marks_session_failed(provider_env):
