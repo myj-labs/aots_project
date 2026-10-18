@@ -744,6 +744,7 @@ const pending = [];
 window.fetch = (path) => new Promise(resolve => pending.push({{path, resolve}}));
 const answer = (entry, which) => {{
   const route = RESPONSES[which][entry.path];
+  if (!route) return;   // requests outside the refresh (e.g. provider status) stay pending
   entry.resolve({{ok: route[0] < 400, status: route[0], json: async () => route[1]}});
 }};
 </script>
