@@ -75,6 +75,22 @@ def provider_disconnect():
     return provider_session.disconnect()
 
 
+@app.get("/api/provider/quote")
+def provider_quote(symbol: str = "NIFTY"):
+    try:
+        return provider_session.index_quote(symbol)
+    except ProviderRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.get("/api/provider/option-chain")
+def provider_option_chain(underlying: str = "NIFTY", expiry: str = ""):
+    try:
+        return provider_session.option_chain(underlying, expiry)
+    except ProviderRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
