@@ -202,6 +202,27 @@ Future Groww adapter: read-only market-data/account functions first.
 Live execution is not implemented in this starter.
 ```
 
+## Market data provider (runtime credentials)
+
+The dashboard's **Market Data Provider** panel lets an operator enter provider credentials at runtime. Paper trades stay simulated and are never sent to a broker; no order-placement method exists.
+
+Endpoints: `GET /api/provider/status`, `POST /api/provider/connect`, `POST /api/provider/disconnect`.
+
+Connect body (Groww; Kite is listed but disabled and rejected until its adapter exists):
+
+- `{"provider":"groww","auth_method":"totp","api_key":"…","totp_secret":"…"}`
+- `{"provider":"groww","auth_method":"approval","api_key":"…","api_secret":"…"}`
+
+Credential lifecycle:
+
+- Credentials are held only in backend process memory (`aots/provider_session.py`), inside the active provider connection object. They are never written to SQLite, `.env`, configuration, audit events or logs, and are never returned by any endpoint. Validation errors on `/api/provider/*` omit the submitted values.
+- The browser clears the inputs as soon as the form is submitted and on disconnect; nothing is kept in browser storage, cookies or URLs.
+- Each Connect first closes any existing session, so a failed attempt never leaves stale credentials. Disconnect and application shutdown close the session and drop the references. Repeated Connect/Disconnect is safe.
+- Status states: `not_configured`, `credentials_in_memory`, `connecting`, `connected`, `failed`, `disconnected`. `connected` is reported only after a real verification request succeeds.
+- Limitation: Python cannot securely erase immutable strings. Dropping references makes the values eligible for garbage collection, but copies may remain in process memory until then (and in the request body buffers of the web server).
+
+**The Groww transport is still a placeholder.** No network call is made; a connect request ends in `credentials_in_memory` ("live connection not implemented"). The two auth methods and their fields (API key + TOTP secret; API key + API secret with daily manual approval) come from secondary sources, because the official Groww documentation could not be read when this was built. Verify them against the current official docs before implementing the token exchange.
+
 ## Groww integration boundary
 
 See `docs/GROWW_INTEGRATION.md`. Groww's official API documentation describes authentication, option-chain/Greeks endpoints, order APIs, and WebSocket capabilities. This project intentionally only defines an adapter contract and does not invoke the live order endpoints. API permissions, token handling, product availability, rate limits, supported order types, and account-specific eligibility must be verified against current official documentation and broker support before any integration.

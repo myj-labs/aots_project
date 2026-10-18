@@ -1,8 +1,10 @@
-from contextlib import asynccontextmanager
+﻿from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from .config import get_settings
 from .database import Database, IdempotencyConflict
@@ -13,6 +15,11 @@ from .models import (
     StrategyEvaluationRequest,
 )
 from .paper import PaperBroker
+from .provider_session import (
+    ProviderConnectRequest,
+    ProviderRequestError,
+    ProviderSessionManager,
+)
 from .risk import RiskEngine, RiskRejected
 from .strategy_service import StrategyService
 
@@ -23,15 +30,49 @@ paper = PaperBroker(settings, db, risk)
 STATIC_DIR = Path(__file__).parent / "static"
 
 
+provider_session = ProviderSessionManager()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.event("APP_STARTED", {"mode": settings.trading_mode, "broker": settings.broker})
     yield
+    provider_session.shutdown()
     db.event("APP_STOPPED", {})
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith("/api/provider/"):
+        # Default errors echo submitted values; drop them so secrets never leak.
+        safe = [
+            {"loc": list(e.get("loc", ())), "type": e.get("type"), "msg": e.get("msg")}
+            for e in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": safe})
+    return await request_validation_exception_handler(request, exc)
+
+
+@app.get("/api/provider/status")
+def provider_status():
+    return provider_session.status()
+
+
+@app.post("/api/provider/connect")
+def provider_connect(req: ProviderConnectRequest):
+    try:
+        return provider_session.connect(req)
+    except ProviderRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.post("/api/provider/disconnect")
+def provider_disconnect():
+    return provider_session.disconnect()
 
 
 @app.get("/", response_class=HTMLResponse)

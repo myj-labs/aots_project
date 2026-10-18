@@ -167,3 +167,49 @@ $("trades-body").addEventListener("click",async(e)=>{
   }catch(err){await refresh();alert(err.message);}
 });
 refresh();
+
+// Market-data provider panel. Credentials are only sent in the connect request body and are
+// cleared from the inputs immediately; nothing is stored in browser storage, URLs or cookies.
+const PROVIDER_LABELS = {
+  not_configured:"Not configured", credentials_in_memory:"Credentials in memory; live connection not implemented",
+  connecting:"Connecting", connected:"Connected", failed:"Connection failed", disconnected:"Disconnected"
+};
+function clearProviderInputs() {
+  document.querySelectorAll("#provider-form input").forEach(i => { i.value = ""; });
+}
+function renderProviderStatus(s) {
+  $("provider-status").textContent = PROVIDER_LABELS[s.state] || "Unknown";
+  $("provider-status").dataset.state = s.state;
+  const detail = s.failure_reason ? ` ${s.failure_reason}` : "";
+  $("provider-message").textContent = (PROVIDER_LABELS[s.state] || "") + "." + detail;
+  $("provider-message").className = s.state === "failed" ? "negative" : "muted";
+}
+function syncProviderFields() {
+  const method = $("provider-auth-method").value;
+  document.querySelectorAll("#provider-form [data-auth]").forEach(l => {
+    const show = l.dataset.auth === method;
+    l.hidden = !show;
+    if(!show) l.querySelector("input").value = "";
+  });
+}
+async function loadProviderStatus() {
+  try { renderProviderStatus(await api("/api/provider/status")); }
+  catch(err) { $("provider-message").textContent = "Provider status unavailable."; $("provider-message").className = "negative"; }
+}
+$("provider-auth-method").addEventListener("change", syncProviderFields);
+$("provider-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = {};
+  new FormData(e.target).forEach((v, k) => { if(v !== "") body[k] = v; });
+  const payload = JSON.stringify(body);
+  clearProviderInputs();
+  $("provider-message").textContent = "Connecting…"; $("provider-message").className = "muted";
+  try { renderProviderStatus(await api("/api/provider/connect", {method:"POST", body:payload})); }
+  catch(err) { $("provider-message").textContent = err.message; $("provider-message").className = "negative"; }
+});
+$("provider-disconnect").addEventListener("click", async () => {
+  clearProviderInputs();
+  try { renderProviderStatus(await api("/api/provider/disconnect", {method:"POST"})); }
+  catch(err) { $("provider-message").textContent = err.message; $("provider-message").className = "negative"; }
+});
+loadProviderStatus();

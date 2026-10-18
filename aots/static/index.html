@@ -61,6 +61,25 @@
       </form>
     </article>
   </section>
+  <section class="panel" id="provider-panel">
+    <div class="panel-heading">
+      <div><h2>Market Data Provider</h2>
+        <p class="muted">Paper trades are simulated and never sent to a broker. Credentials are held in backend memory only and are never saved or shown again.</p></div>
+      <span id="provider-status" class="pill">Not configured</span>
+    </div>
+    <form id="provider-form" autocomplete="off">
+      <div class="form-row">
+        <label>Provider<select name="provider" id="provider-select"><option value="groww" selected>Groww</option><option value="kite" disabled>Zerodha Kite (Coming soon)</option></select></label>
+        <label>Authentication method<select name="auth_method" id="provider-auth-method"><option value="totp" selected>API key + TOTP secret</option><option value="approval">API key + API secret (daily approval)</option></select></label>
+        <label>API key<input name="api_key" type="password" autocomplete="off" spellcheck="false"></label>
+        <label data-auth="totp">TOTP secret<input name="totp_secret" type="password" autocomplete="off" spellcheck="false"></label>
+        <label data-auth="approval" hidden>API secret<input name="api_secret" type="password" autocomplete="off" spellcheck="false"></label>
+      </div>
+      <button type="submit" id="provider-connect">Connect</button>
+      <button type="button" id="provider-disconnect">Disconnect</button>
+      <p id="provider-message" role="status" class="muted"></p>
+    </form>
+  </section>
   <section class="panel">
     <div class="panel-heading">
       <div><h2>Deterministic strategy demonstration</h2>
