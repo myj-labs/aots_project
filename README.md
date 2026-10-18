@@ -206,22 +206,29 @@ Live execution is not implemented in this starter.
 
 The dashboard's **Market Data Provider** panel lets an operator enter provider credentials at runtime. Paper trades stay simulated and are never sent to a broker; no order-placement method exists.
 
-Endpoints: `GET /api/provider/status`, `POST /api/provider/connect`, `POST /api/provider/disconnect`.
+Endpoints:
+
+- `GET /api/provider/status`
+- `POST /api/provider/connect`
+- `POST /api/provider/disconnect`
+- `GET /api/provider/quote?symbol=NIFTY`
+- `GET /api/provider/option-chain?underlying=NIFTY&expiry=YYYY-MM-DD`
 
 Connect body (Groww; Kite is listed but disabled and rejected until its adapter exists):
 
 - `{"provider":"groww","auth_method":"totp","api_key":"…","totp_secret":"…"}`
 - `{"provider":"groww","auth_method":"approval","api_key":"…","api_secret":"…"}`
 
-Credential lifecycle:
+Credential and token lifecycle:
 
-- Credentials are held only in backend process memory (`aots/provider_session.py`), inside the active provider connection object. They are never written to SQLite, `.env`, configuration, audit events or logs, and are never returned by any endpoint. Validation errors on `/api/provider/*` omit the submitted values.
+- Credentials are held only in backend process memory (`aots/provider_session.py`), inside the active provider connection object. After successful authentication, only the access token remains in memory. Credentials and tokens are never written to SQLite, `.env`, configuration, audit events or logs, and are never returned by any endpoint. Validation errors on `/api/provider/*` omit submitted values.
 - The browser clears the inputs as soon as the form is submitted and on disconnect; nothing is kept in browser storage, cookies or URLs.
-- Each Connect first closes any existing session, so a failed attempt never leaves stale credentials. Disconnect and application shutdown close the session and drop the references. Repeated Connect/Disconnect is safe.
+- Each Connect first closes any existing session, so a failed attempt never leaves stale credentials. Disconnect and application shutdown close the session and drop all references. Repeated Connect/Disconnect is safe.
 - Status states: `not_configured`, `credentials_in_memory`, `connecting`, `connected`, `failed`, `disconnected`. `connected` is reported only after a real verification request succeeds.
+- Groww token exchange follows the official docs: `POST /v1/token/api/access` with `Authorization: Bearer &lt;api_key&gt;`. Approval flow sends `key_type=approval` with checksum `sha256(secret + epoch_seconds)` and timestamp. TOTP flow sends `key_type=totp` with a generated RFC 6238 code from the supplied seed.
+- Access tokens are treated as expiring at the next 06:00 IST boundary (per official docs). Expired/invalid tokens force a safe failed state and require reconnect.
+- Read-only market data is normalized through the backend using official endpoints (`/v1/live-data/quote` and `/v1/option-chain/exchange/{exchange}/underlying/{underlying}` with `expiry_date=YYYY-MM-DD`). The application currently supports `NSE/NIFTY` for this runtime slice.
 - Limitation: Python cannot securely erase immutable strings. Dropping references makes the values eligible for garbage collection, but copies may remain in process memory until then (and in the request body buffers of the web server).
-
-**The Groww transport is still a placeholder.** No network call is made; a connect request ends in `credentials_in_memory` ("live connection not implemented"). The two auth methods and their fields (API key + TOTP secret; API key + API secret with daily manual approval) come from secondary sources, because the official Groww documentation could not be read when this was built. Verify them against the current official docs before implementing the token exchange.
 
 ## Groww integration boundary
 

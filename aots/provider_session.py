@@ -1,15 +1,19 @@
 """Runtime-only market-data provider session manager.
 
-Credentials live only in this process's memory, inside the active provider
-connection object. They are never written to SQLite, configuration, audit
-events or logs. Python cannot guarantee secure erasure of immutable ``str``
-objects; disconnecting drops every reference this module holds so the values
-become eligible for garbage collection, but copies may linger until then.
+Credentials and tokens live only in this process's memory, inside the active
+provider connection object. They are never written to SQLite, configuration,
+audit events or logs. Python cannot guarantee secure erasure of immutable
+``str`` objects; disconnecting drops every reference this module holds so the
+values become eligible for garbage collection, but copies may linger until then.
 """
+
 import logging
 import threading
-from typing import Callable, Literal, Mapping, Protocol
+from typing import Callable, Literal, Mapping, Protocol, cast
+
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
+
+from .brokers.base import MarketDataProvider, ProviderError
 
 logger = logging.getLogger("aots.provider")
 
@@ -22,9 +26,6 @@ PROVIDER_STATES = (
     "disconnected",
 )
 
-# Required credential fields per provider and authentication method.
-# Groww: derived from secondary sources describing the Groww Trade API; the
-# official documentation could not be read in this environment (see README).
 AUTH_METHODS: dict[str, dict[str, tuple[str, ...]]] = {
     "groww": {
         "totp": ("api_key", "totp_secret"),
@@ -38,7 +39,7 @@ CREDENTIAL_FIELDS = ("api_key", "totp_secret", "api_secret")
 
 
 class ProviderRequestError(Exception):
-    """Safe-to-return error; its message never contains credential values."""
+    """Safe-to-return API error; its message never contains credential values."""
 
     def __init__(self, message: str, status_code: int = 400):
         super().__init__(message)
@@ -50,23 +51,19 @@ class ProviderConnectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     provider: Literal["groww", "kite"]
     auth_method: Literal["totp", "approval"]
-    api_key: SecretStr | None = Field(default=None, max_length=512)
-    totp_secret: SecretStr | None = Field(default=None, max_length=512)
-    api_secret: SecretStr | None = Field(default=None, max_length=512)
+    api_key: SecretStr | None = Field(default=None, max_length=2048)
+    totp_secret: SecretStr | None = Field(default=None, max_length=2048)
+    api_secret: SecretStr | None = Field(default=None, max_length=2048)
 
 
-class ProviderConnection(Protocol):
-    """One provider's authenticated session; owns the credential references."""
+class ProviderConnection(MarketDataProvider, Protocol):
+    """One provider's authenticated session; owns credential and token references."""
 
     def verify(self) -> None:
-        """Perform a documented verification request.
-
-        Return normally only after a real successful verification. Raise
-        NotImplementedError when the transport is not implemented.
-        """
+        """Authenticate and initialize this provider session."""
 
     def close(self) -> None:
-        """Stop provider resources and discard credential references."""
+        """Stop provider resources and discard credential/token references."""
 
 
 ConnectionFactory = Callable[[str, Mapping[str, str]], ProviderConnection]
@@ -116,31 +113,33 @@ class ProviderSessionManager:
     def _provider_implements_live(self) -> bool:
         return bool(getattr(self._connection, "live_connection_implemented", False))
 
+    def _active_connection(self) -> ProviderConnection:
+        with self._lock:
+            connection = self._connection
+            state = self._state
+        if connection is None or state != "connected":
+            raise ProviderRequestError("Provider is not connected.", 409)
+        return cast(ProviderConnection, connection)
+
     def connect(self, request: ProviderConnectRequest) -> dict:
         provider = request.provider
         if provider not in AVAILABLE_PROVIDERS or provider not in self._factories:
-            raise ProviderRequestError(
-                f"{PROVIDER_LABELS[provider]} is not available yet.", 400
-            )
+            raise ProviderRequestError(f"{PROVIDER_LABELS[provider]} is not available yet.", 400)
         required = AUTH_METHODS[provider].get(request.auth_method)
         if required is None:
             raise ProviderRequestError("Unsupported authentication method for this provider.", 400)
+
         creds: dict[str, str] = {}
         for field in CREDENTIAL_FIELDS:
             secret = getattr(request, field)
             value = secret.get_secret_value() if secret is not None else ""
             if field in required:
                 if not value.strip():
-                    raise ProviderRequestError(
-                        "Missing required credential fields: "
-                        + ", ".join(f for f in required if not _present(request, f)),
-                        400,
-                    )
+                    missing = ", ".join(f for f in required if not _present(request, f))
+                    raise ProviderRequestError(f"Missing required credential fields: {missing}", 400)
                 creds[field] = value
             elif value:
-                raise ProviderRequestError(
-                    f"Field {field} is not used by this authentication method.", 400
-                )
+                raise ProviderRequestError(f"Field {field} is not used by this authentication method.", 400)
 
         # Defined cleanup path: any prior session is closed before a new attempt
         # so a failed attempt never leaves, or silently keeps, stale credentials.
@@ -149,6 +148,7 @@ class ProviderSessionManager:
             self._generation += 1
             generation = self._generation
         _safe_close(old)
+
         try:
             connection = self._factories[provider](request.auth_method, creds)
         except Exception:
@@ -161,6 +161,7 @@ class ProviderSessionManager:
             return self.status()
         finally:
             creds.clear()
+
         with self._lock:
             if generation != self._generation:
                 superseded = True
@@ -179,9 +180,12 @@ class ProviderSessionManager:
             outcome = ("connected", None)
         except NotImplementedError:
             outcome = ("credentials_in_memory", None)
+        except ProviderError as exc:
+            outcome = ("failed", exc.safe_message)
         except Exception:
             logger.warning("Provider verification failed (details withheld).")
             outcome = ("failed", "Provider verification failed.")
+
         with self._lock:
             if generation != self._generation:
                 stale = True
@@ -193,6 +197,41 @@ class ProviderSessionManager:
         if stale or outcome[0] == "failed":
             _safe_close(connection)
         return self.status()
+
+    def index_quote(self, symbol: str) -> dict:
+        try:
+            quote = self._active_connection().get_index_quote(symbol)
+        except ProviderError as exc:
+            self._on_provider_error(exc)
+        return quote.__dict__
+
+    def option_chain(self, underlying: str, expiry: str) -> dict:
+        try:
+            chain = self._active_connection().get_option_chain_data(underlying, expiry)
+        except ValueError as exc:
+            raise ProviderRequestError(str(exc), 422)
+        except ProviderError as exc:
+            self._on_provider_error(exc)
+        return {
+            **chain.__dict__,
+            "strikes": [
+                {
+                    "strike": s.strike,
+                    "call": _option_quote_payload(s.call),
+                    "put": _option_quote_payload(s.put),
+                }
+                for s in chain.strikes
+            ],
+        }
+
+    def _on_provider_error(self, exc: ProviderError):
+        if exc.status_code == 401:
+            with self._lock:
+                old = self._detach_locked()
+                self._state = "failed"
+                self._failure = exc.safe_message
+            _safe_close(old)
+        raise ProviderRequestError(exc.safe_message, exc.status_code)
 
     def disconnect(self) -> dict:
         with self._lock:
@@ -214,6 +253,18 @@ class ProviderSessionManager:
 def _present(request: ProviderConnectRequest, field: str) -> bool:
     secret = getattr(request, field)
     return secret is not None and bool(secret.get_secret_value().strip())
+
+
+def _option_quote_payload(quote):
+    if quote is None:
+        return None
+    return {
+        "trading_symbol": quote.trading_symbol,
+        "ltp": quote.ltp,
+        "open_interest": quote.open_interest,
+        "volume": quote.volume,
+        "greeks": None if quote.greeks is None else quote.greeks.__dict__,
+    }
 
 
 def _safe_close(connection: ProviderConnection | None) -> None:
