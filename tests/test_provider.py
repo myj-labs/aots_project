@@ -1,4 +1,4 @@
-﻿import json
+import json
 import logging
 import sqlite3
 import threading
@@ -60,8 +60,11 @@ def provider_env(tmp_path, monkeypatch):
     return SimpleNamespace(settings=settings, db=db, install=install, tmp_path=tmp_path)
 
 
-def fake_manager(created, verify=None, create_error=None):
+def fake_manager(created, verify=None, create_error=None, received=None):
     def factory(auth_method, creds):
+        if received is not None:
+            # Snapshot taken at call time, independent of the connection's mutable dict.
+            received.append((auth_method, dict(creds)))
         if create_error:
             raise create_error
         conn = FakeConnection(creds, verify)
@@ -128,11 +131,14 @@ def test_disconnect_discards_session_and_is_repeatable(provider_env):
 
 
 def test_only_required_credentials_are_passed_to_the_provider(provider_env):
-    created = []
-    provider_env.install(fake_manager(created))
+    created, received = [], []
+    provider_env.install(fake_manager(created, received=received))
     with TestClient(app) as client:
         client.post("/api/provider/connect", json=APPROVAL)
-    assert created[0].creds == {"api_key": MARKER + "-key", "api_secret": MARKER + "-sec"} or created[0].closed
+    assert received == [
+        ("approval", {"api_key": MARKER + "-key", "api_secret": MARKER + "-sec"})
+    ]
+    assert created[0].closed is True and created[0].creds == {}
 
 
 def test_shutdown_cleans_up_runtime_session(provider_env):
@@ -185,14 +191,21 @@ def test_session_creation_exception_does_not_leak(provider_env, caplog):
 
 def test_rejected_request_leaves_prior_session_untouched(provider_env):
     created = []
-    provider_env.install(fake_manager(created))
+    manager = provider_env.install(fake_manager(created))
     with TestClient(app) as client:
-        client.post("/api/provider/connect", json=TOTP)
+        assert client.post("/api/provider/connect", json=TOTP).status_code == 200
+        original = created[0]
+        before = client.get("/api/provider/status").json()
+        assert before["state"] == "connected" and before["configured"] is True
         bad = {**TOTP, "totp_secret": " "}
         assert client.post("/api/provider/connect", json=bad).status_code == 400
-        # validation errors happen before any session change; the prior session is unaffected
-        assert client.get("/api/provider/status").json()["state"] == "credentials_in_memory" or True
-    assert all(c.closed for c in created)
+        # Rejected before any session change: same connection object, still open, same status.
+        assert manager._connection is original
+        assert original.closed is False
+        assert original.creds == {"api_key": MARKER + "-key", "totp_secret": MARKER + "-totp"}
+        assert len(created) == 1
+        assert client.get("/api/provider/status").json() == before
+    assert original.closed is True and original.creds == {}
 
 
 def test_verified_connection_is_reported_connected_only_after_success(provider_env):
