@@ -51,9 +51,9 @@ class ProviderConnectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     provider: Literal["groww", "kite"]
     auth_method: Literal["totp", "approval"]
-    api_key: SecretStr | None = Field(default=None, max_length=512)
-    totp_secret: SecretStr | None = Field(default=None, max_length=512)
-    api_secret: SecretStr | None = Field(default=None, max_length=512)
+    api_key: SecretStr | None = Field(default=None, max_length=2048)
+    totp_secret: SecretStr | None = Field(default=None, max_length=2048)
+    api_secret: SecretStr | None = Field(default=None, max_length=2048)
 
 
 class ProviderConnection(MarketDataProvider, Protocol):

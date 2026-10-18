@@ -236,11 +236,13 @@ class GrowwRuntimeConnection:
         }
         status, data = self._send("POST", GROWW_BASE_URL + TOKEN_PATH, headers, body, auth=True)
         token = data.get("token") if isinstance(data, dict) else None
+        is_active = data.get("isActive") if isinstance(data, dict) else None
         if (
             status != 200
             or not isinstance(token, str)
             or not _TOKEN_RE.match(token)
-            or data.get("isActive") is not True
+            or is_active is False
+            or (is_active is not None and is_active is not True)
         ):
             raise ProviderResponseError()
         self._token = token

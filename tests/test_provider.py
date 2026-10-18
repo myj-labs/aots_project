@@ -197,17 +197,23 @@ def test_connect_rejects_malformed_auth_response(provider_env):
     assert body["state"] == "failed" and body["configured"] is False
 
 
-@pytest.mark.parametrize(
-    "response",
-    [
-        {"token": "tok-12345678"},
-        {"token": "tok-12345678", "isActive": False},
-    ],
-)
-def test_token_response_requires_explicit_active_flag(provider_env, response):
+def test_token_response_without_optional_active_flag_is_accepted(provider_env):
     mgr, _, _ = groww_manager_with_transport(
         [datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)],
-        responses=[(200, response)],
+        responses=[(200, {"token": "tok-12345678"})],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        body = client.post("/api/provider/connect", json=APPROVAL).json()
+    assert body["state"] == "connected"
+    assert body["connected"] is True
+    assert body["configured"] is True
+
+
+def test_token_response_with_inactive_flag_is_rejected(provider_env):
+    mgr, _, _ = groww_manager_with_transport(
+        [datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)],
+        responses=[(200, {"token": "tok-12345678", "isActive": False})],
     )
     provider_env.install(mgr)
     with TestClient(app) as client:
@@ -236,6 +242,42 @@ def test_only_required_credentials_are_passed_to_the_provider(provider_env):
         client.post("/api/provider/connect", json=APPROVAL)
     assert received == [("approval", {"api_key": MARKER + "-key", "api_secret": MARKER + "-sec"})]
     assert created[0].closed is True and created[0].creds == {}
+
+
+def test_groww_credentials_of_1011_characters_are_accepted(provider_env):
+    api_key = "K" * 1011
+    api_secret = "S" * 1011
+    payload = {
+        "provider": "groww",
+        "auth_method": "approval",
+        "api_key": api_key,
+        "api_secret": api_secret,
+    }
+    provider_env.install(ProviderSessionManager({
+        "groww": lambda method, creds: FakeConnection(creds),
+    }))
+    with TestClient(app) as client:
+        response = client.post("/api/provider/connect", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "connected"
+    assert api_key not in response.text
+    assert api_secret not in response.text
+
+
+def test_provider_credential_length_remains_bounded(provider_env):
+    too_long = "K" * 2049
+    payload = {
+        "provider": "groww",
+        "auth_method": "approval",
+        "api_key": too_long,
+        "api_secret": "S" * 1011,
+    }
+    with TestClient(app) as client:
+        response = client.post("/api/provider/connect", json=payload)
+
+    assert response.status_code == 422
+    assert too_long not in response.text
 
 
 def test_rejected_request_leaves_prior_session_untouched(provider_env):
