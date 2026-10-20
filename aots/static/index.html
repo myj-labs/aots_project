@@ -80,6 +80,28 @@
       <p id="provider-message" role="status" class="muted"></p>
     </form>
   </section>
+  <section class="panel" id="account-insights-panel">
+    <div class="panel-heading">
+      <div><h2>Groww account insights</h2>
+        <p class="muted">Connection: <strong id="account-connection-state">Not configured</strong>. Read-only Groww account data; separate from simulated AOTS paper trades and risk P&amp;L.</p></div>
+      <span id="account-insights-state" class="pill">Not refreshed</span>
+    </div>
+    <div class="account-actions">
+      <button type="button" id="account-insights-refresh">Refresh account data</button>
+      <span id="account-refresh-time" class="muted">Last successful refresh: Not yet refreshed</span>
+    </div>
+    <p id="account-insights-message" role="status" class="muted">Connect Groww, then refresh to retrieve account information.</p>
+    <div class="account-metrics">
+      <article class="metric"><span>Today's P&amp;L</span><strong id="groww-today-pnl">Unavailable</strong><small id="groww-today-pnl-reason">Not refreshed</small></article>
+      <article class="metric"><span>Clear cash available</span><strong id="groww-clear-cash">Unavailable</strong><small>Groww margin response; not AOTS capital</small></article>
+      <article class="metric"><span>Collateral available</span><strong id="groww-collateral">Unavailable</strong><small>Reported separately; not added to clear cash</small></article>
+    </div>
+    <h3>Groww positions</h3>
+    <p class="muted">Groww-reported realised P&amp;L is shown per position with no assumed time scope. Missing values remain unavailable; numeric zero is displayed as ₹0.</p>
+    <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Segment</th><th>Exchange</th><th>Product</th><th>Net quantity</th><th>Net price (₹)</th><th>Reported realised P&amp;L (₹; scope unspecified)</th></tr></thead><tbody id="groww-positions"><tr><td colspan="7" class="muted">Not refreshed</td></tr></tbody></table></div>
+    <h3>Groww holdings</h3>
+    <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Quantity</th><th>Average price (₹)</th><th>Pledged quantity</th><th>T1 quantity</th></tr></thead><tbody id="groww-holdings"><tr><td colspan="5" class="muted">Not refreshed</td></tr></tbody></table></div>
+  </section>
   <section class="panel">
     <div class="panel-heading">
       <div><h2>Deterministic strategy demonstration</h2>

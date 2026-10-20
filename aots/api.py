@@ -91,6 +91,14 @@ def provider_option_chain(underlying: str = "NIFTY", expiry: str = ""):
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
 
+@app.get("/api/provider/account-insights")
+def provider_account_insights():
+    try:
+        return provider_session.account_insights()
+    except ProviderRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     return (STATIC_DIR / "index.html").read_text(encoding="utf-8")

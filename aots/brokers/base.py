@@ -1,5 +1,5 @@
 ﻿from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 
 class BrokerReadOnly(Protocol):
@@ -104,4 +104,11 @@ class MarketDataProvider(Protocol):
         ...
 
     def get_option_chain_data(self, underlying: str, expiry: str) -> OptionChain:
+        ...
+
+
+class AccountInsightsProvider(Protocol):
+    """Read-only account snapshots, separate from strategy/risk market data."""
+
+    def get_account_insights(self) -> dict[str, Any]:
         ...

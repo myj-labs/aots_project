@@ -384,6 +384,184 @@ def test_provider_option_chain_rejects_invalid_expiry(provider_env):
     assert bad.status_code == 422
 
 
+def account_responses(*, positions_fno=None, positions_cash=None, holdings=None, margins=None):
+    return [
+        (200, {"token": "tok-12345678"}),
+        (200, {"status": "SUCCESS", "payload": {"positions": positions_fno or []}}),
+        (200, {"status": "SUCCESS", "payload": {"positions": positions_cash or []}}),
+        (200, {"status": "SUCCESS", "payload": {"holdings": holdings or []}}),
+        (200, {"status": "SUCCESS", "payload": margins or {}}),
+    ]
+
+
+def test_account_insights_normalizes_positions_holdings_and_margins(provider_env, caplog):
+    caplog.set_level(logging.DEBUG)
+    now = datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)
+    fno = [{
+        "trading_symbol": "NIFTY25JAN25000CE",
+        "segment": "FNO",
+        "exchange": "NSE",
+        "product": "MIS",
+        "quantity": -50,
+        "net_price": 125.5,
+        "net_carry_forward_quantity": 0,
+        "net_carry_forward_price": 0,
+        "realised_pnl": 320,
+        "private_data": "must not be returned",
+    }]
+    holdings = [{
+        "trading_symbol": "RELIANCE",
+        "quantity": 10,
+        "average_price": 100,
+        "pledge_quantity": 2,
+        "t1_quantity": 3,
+        "isin": "must not be returned",
+    }]
+    margins = {
+        "clear_cash": 5000,
+        "net_margin_used": 35000,
+        "collateral_available": 7000,
+        "fno_margin_details": {
+            "option_buy_balance_available": 11000,
+            "option_sell_balance_available": 1000,
+        },
+    }
+    mgr, _, transports = groww_manager_with_transport(
+        [now],
+        responses=account_responses(positions_fno=fno, holdings=holdings, margins=margins),
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        assert client.post("/api/provider/connect", json=APPROVAL).json()["state"] == "connected"
+        response = client.get("/api/provider/account-insights")
+    data = response.json()
+    assert response.status_code == 200
+    assert data["refreshed_at"] == now.isoformat()
+    assert data["positions"]["items"][0]["quantity"] == -50
+    assert data["positions"]["items"][0]["reported_realised_pnl"] == 320
+    assert data["positions"]["items"][0]["segment"] == "FNO"
+    assert data["holdings"]["items"][0]["average_price"] == 100
+    assert data["balances"]["values"]["clear_cash"] == 5000
+    assert data["today_pnl"]["status"] == "unavailable"
+    assert data["today_pnl"]["value"] is None
+    assert isinstance(data["today_pnl"]["reason"], str)
+    assert "does not specify a daily time scope" in data["today_pnl"]["reason"]
+    assert "private_data" not in response.text and "must not be returned" not in response.text
+    assert "isin" not in response.text
+    assert "tok-12345678" not in response.text and "tok-12345678" not in caplog.text
+    account_calls = transports[0].calls[1:]
+    assert [call[1].split("?", 1)[0].removeprefix("https://api.groww.in") for call in account_calls] == [
+        "/v1/positions/user", "/v1/positions/user", "/v1/holdings/user",
+        "/v1/margins/detail/user",
+    ]
+    assert "segment=FNO" in account_calls[0][1]
+    assert "segment=CASH" in account_calls[1][1]
+
+
+def test_account_insights_preserves_zero_and_missing_values(provider_env):
+    now = datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)
+    fno = [{
+        "trading_symbol": "NIFTY25JAN25000CE",
+        "quantity": 0,
+        "realised_pnl": 0,
+    }]
+    margins = {"clear_cash": 0}
+    mgr, _, _ = groww_manager_with_transport(
+        [now],
+        responses=account_responses(positions_fno=fno, margins=margins),
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        data = client.get("/api/provider/account-insights").json()
+    position = data["positions"]["items"][0]
+    assert position["quantity"] == 0
+    assert position["reported_realised_pnl"] == 0
+    assert position["net_price"] is None
+    assert data["holdings"]["status"] == "available" and data["holdings"]["items"] == []
+    assert data["balances"]["status"] == "available"
+    assert data["balances"]["values"]["clear_cash"] == 0
+    assert data["balances"]["values"]["collateral_available"] is None
+    assert data["today_pnl"]["value"] is None
+
+
+def test_account_insights_marks_missing_response_fields_unavailable(provider_env):
+    now = datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)
+    mgr, _, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678"}),
+            (200, {"status": "SUCCESS", "payload": {}}),
+            (200, {"status": "SUCCESS", "payload": {"positions": []}}),
+            (200, {"status": "SUCCESS", "payload": {}}),
+            (200, {"status": "SUCCESS", "payload": {}}),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        data = client.get("/api/provider/account-insights").json()
+    assert data["positions"]["status"] == "partial"
+    assert data["positions"]["items"] == []
+    assert data["holdings"]["status"] == "unavailable"
+    assert data["holdings"]["items"] is None
+    assert data["balances"]["status"] == "unavailable"
+    assert data["balances"]["values"]["clear_cash"] is None
+
+
+def test_account_insights_partial_provider_failure_is_not_fabricated_as_empty(provider_env):
+    now = datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)
+    mgr, _, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678"}),
+            (500, None),
+            (200, {"status": "SUCCESS", "payload": {"positions": []}}),
+            (200, {"status": "SUCCESS", "payload": {"holdings": []}}),
+            (200, {"status": "SUCCESS", "payload": {"clear_cash": 0}}),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        data = client.get("/api/provider/account-insights").json()
+    assert data["positions"]["status"] == "partial"
+    assert data["positions"]["reason"] == "One positions segment is unavailable."
+    assert data["holdings"]["status"] == "available" and data["holdings"]["items"] == []
+    assert data["balances"]["values"]["clear_cash"] == 0
+
+
+def test_account_insights_auth_failure_expires_session_safely(provider_env, caplog):
+    caplog.set_level(logging.DEBUG)
+    now = datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)
+    mgr, created, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678"}),
+            (
+                401,
+                {
+                    "status": "FAILURE",
+                    "error": {"code": "GA005", "message": MARKER},
+                },
+            ),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.get("/api/provider/account-insights")
+        status = client.get("/api/provider/status").json()
+    assert response.status_code == 401
+    assert response.json()["detail"] == (
+        "Groww rejected the access token (invalid or expired); reconnect."
+    )
+    assert status["state"] == "failed" and status["configured"] is False
+    assert mgr._connection is None and created[0]._token is None
+    assert MARKER not in response.text and MARKER not in caplog.text
+    assert "tok-12345678" not in response.text and "tok-12345678" not in caplog.text
+
+
 def test_provider_market_data_handles_upstream_failure(provider_env):
     now = datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)
     mgr, _, _ = groww_manager_with_transport([now], responses=[
@@ -529,6 +707,104 @@ def test_dashboard_has_masked_inputs_and_no_browser_storage():
     assert 'value="kite" disabled' in html_text
     for banned in ("localStorage", "sessionStorage", "indexedDB", "document.cookie"):
         assert banned not in js
+
+
+@needs_browser
+def test_account_insights_dashboard_refresh_states_and_stale_data(tmp_path):
+    snapshot = _run_harness_page(tmp_path, f"""<script>
+let accountCalls = 0;
+let sessionExpired = false;
+const accountData = {{
+  refreshed_at: "2025-01-03T00:00:00+00:00",
+  today_pnl: {{status:"unavailable", value:null, reason:"Today's P&L cannot be determined."}},
+  positions: {{status:"available", reason:null, items:[{{
+    trading_symbol:"NIFTY-TEST-CE", segment:"FNO", exchange:"NSE", product:"MIS",
+    quantity:50, net_price:10, reported_realised_pnl:0
+  }}]}},
+  holdings: {{status:"unavailable", reason:"Groww holdings are unavailable.", items:null}},
+  balances: {{status:"available", reason:null, values:{{clear_cash:0, collateral_available:null}}}}
+}};
+const body = {{
+  "/api/status": {{app_name:"AOTS", environment:"test", broker:"groww", mode:"paper",
+    underlying:"NIFTY", live_trading_enabled:false, capital_inr:100000,
+    strategy_spot_threshold:25000, trade_count:0}},
+  "/api/risk": {{daily_pnl:0, realised_pnl:0, unrealised_pnl:0, open_positions:0,
+    max_daily_loss_inr:2000, max_trade_risk_pct:.005, max_trade_risk_inr:500,
+    consecutive_losses:0, max_consecutive_losses:3, paused_for_day:false,
+    kill_switch:false}},
+  "/api/trades": [],
+  "/api/strategy/decisions": []
+}};
+window.fetch = async (path) => {{
+  if (path === "/api/provider/account-insights") {{
+    accountCalls++;
+    if (accountCalls === 1) {{
+      await new Promise(r => setTimeout(r, 180));
+      return {{ok:true, status:200, json:async()=>accountData}};
+    }}
+    sessionExpired = true;
+    return {{ok:false, status:401, json:async()=>({{detail:"Groww rejected the access token; reconnect."}})}};
+  }}
+  if (path === "/api/provider/status") {{
+    return {{ok:true, status:200, json:async()=>({{state:sessionExpired ? "failed" : "connected"}})}};
+  }}
+  return {{ok:true, status:200, json:async()=>body[path]}};
+}};
+</script>
+<script src="{(_STATIC_DIR / 'app.js').as_uri()}"></script>
+<script>
+(async () => {{
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  await sleep(100);
+  const automaticCalls = accountCalls;
+  const first = refreshAccountInsights();
+  await sleep(20);
+  const loading = {{
+    state: document.getElementById("account-insights-state").innerText,
+    disabled: document.getElementById("account-insights-refresh").disabled,
+  }};
+  await refreshAccountInsights();
+  const callsWhileLoading = accountCalls;
+  await first;
+  const success = {{
+    state: document.getElementById("account-insights-state").innerText,
+    today: document.getElementById("groww-today-pnl").innerText,
+    todayReason: document.getElementById("groww-today-pnl-reason").innerText,
+    cash: document.getElementById("groww-clear-cash").innerText,
+    collateral: document.getElementById("groww-collateral").innerText,
+    positions: document.getElementById("groww-positions").innerText,
+    holdings: document.getElementById("groww-holdings").innerText,
+    time: document.getElementById("account-refresh-time").innerText,
+  }};
+  await refreshAccountInsights();
+  await sleep(30);
+  const expired = {{
+    state: document.getElementById("account-insights-state").innerText,
+    message: document.getElementById("account-insights-message").innerText,
+    positions: document.getElementById("groww-positions").innerText,
+    time: document.getElementById("account-refresh-time").innerText,
+  }};
+  const pre = document.createElement("pre");
+  pre.id = "snapshot";
+  pre.textContent = JSON.stringify([{{automaticCalls, loading, callsWhileLoading, success, expired}}]);
+  document.body.appendChild(pre);
+}})();
+</script>""")[0]
+    assert snapshot["automaticCalls"] == 0
+    assert snapshot["loading"] == {"state": "Loading", "disabled": True}
+    assert snapshot["callsWhileLoading"] == 1
+    assert snapshot["success"]["state"] == "Partially available"
+    assert snapshot["success"]["today"] == "Unavailable"
+    assert "cannot be determined" in snapshot["success"]["todayReason"]
+    assert snapshot["success"]["cash"] == "₹0.00"
+    assert snapshot["success"]["collateral"] == "Unavailable"
+    assert "NIFTY-TEST-CE" in snapshot["success"]["positions"]
+    assert "₹0.00" in snapshot["success"]["positions"]
+    assert "Groww holdings are unavailable" in snapshot["success"]["holdings"]
+    assert "2025" in snapshot["success"]["time"]
+    assert snapshot["expired"]["state"] == "Session expired"
+    assert "stale" in snapshot["expired"]["message"]
+    assert "NIFTY-TEST-CE" in snapshot["expired"]["positions"]
 
 
 @needs_browser
