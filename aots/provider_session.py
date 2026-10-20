@@ -13,7 +13,7 @@ from typing import Callable, Literal, Mapping, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from .brokers.base import MarketDataProvider, ProviderError
+from .brokers.base import AccountInsightsProvider, MarketDataProvider, ProviderError
 
 logger = logging.getLogger("aots.provider")
 
@@ -56,7 +56,7 @@ class ProviderConnectRequest(BaseModel):
     api_secret: SecretStr | None = Field(default=None, max_length=2048)
 
 
-class ProviderConnection(MarketDataProvider, Protocol):
+class ProviderConnection(MarketDataProvider, AccountInsightsProvider, Protocol):
     """One provider's authenticated session; owns credential and token references."""
 
     def verify(self) -> None:
@@ -223,6 +223,12 @@ class ProviderSessionManager:
                 for s in chain.strikes
             ],
         }
+
+    def account_insights(self) -> dict:
+        try:
+            return self._active_connection().get_account_insights()
+        except ProviderError as exc:
+            self._on_provider_error(exc)
 
     def _on_provider_error(self, exc: ProviderError):
         if exc.status_code == 401:

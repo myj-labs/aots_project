@@ -1,9 +1,7 @@
-﻿"""Groww read-only adapter boundary.
+﻿"""Groww read-only API adapter.
 
-This module intentionally does not instantiate a Groww SDK client and has no order
-placement method. Implement read-only calls only after checking current official docs,
-account permissions, and rate limits. Never add live order methods without a separate
-review and explicit user authorization.
+This module intentionally does not instantiate the Groww SDK and has no order
+placement method. Account and market-data calls use documented read-only endpoints.
 """
 import base64
 import binascii
@@ -22,6 +20,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 
 from .base import (
+    AccountInsightsProvider,
     Greeks,
     IndexQuote,
     OptionChain,
@@ -172,6 +171,16 @@ def _count(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ProviderResponseError()
     if value < 0 or value != int(value):
+        raise ProviderResponseError()
+    return int(value)
+
+
+def _signed_count(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ProviderResponseError()
+    if value != int(value):
         raise ProviderResponseError()
     return int(value)
 
@@ -363,6 +372,151 @@ class GrowwRuntimeConnection:
             fetched_at=self._clock().astimezone(timezone.utc).isoformat(),
             strikes=strikes,
         )
+
+    def get_account_insights(self) -> dict[str, Any]:
+        positions = self._account_section(
+            lambda: self._get("/v1/positions/user", {"segment": "FNO"}),
+            self._normalize_positions,
+        )
+        cash_positions = self._account_section(
+            lambda: self._get("/v1/positions/user", {"segment": "CASH"}),
+            self._normalize_positions,
+        )
+        holdings = self._account_section(
+            lambda: self._get("/v1/holdings/user", {}),
+            self._normalize_holdings,
+        )
+        margins = self._account_section(
+            lambda: self._get("/v1/margins/detail/user", {}),
+            self._normalize_balances,
+            list_response=False,
+        )
+        return {
+            "refreshed_at": self._clock().astimezone(timezone.utc).isoformat(),
+            "today_pnl": {
+                "status": "unavailable",
+                "value": None,
+                "reason": (
+                    "Groww's documented positions field reports realised P&L but does not "
+                    "specify a daily time scope. The free access tier excludes Live Data, "
+                    "so AOTS cannot defensibly calculate today's unrealised P&L."
+                ),
+            },
+            "positions": self._combine_position_sections(positions, cash_positions),
+            "holdings": holdings,
+            "balances": margins,
+        }
+
+    def _account_section(self, fetch, normalize, list_response: bool = True):
+        try:
+            payload = fetch()
+            if not list_response:
+                values = normalize(payload)
+                if not any(value is not None for value in values.values()):
+                    return {
+                        "status": "unavailable",
+                        "reason": "Groww did not return the documented balance fields.",
+                        "values": values,
+                    }
+                return {
+                    "status": "available",
+                    "reason": None,
+                    "values": values,
+                }
+            name = normalize.__name__.removeprefix("_normalize_")
+            values = payload.get(name)
+            if not isinstance(values, list):
+                return {
+                    "status": "unavailable",
+                    "reason": f"Groww did not return the documented {name} list.",
+                    "items": None,
+                }
+            return {"status": "available", "reason": None, "items": normalize(values)}
+        except ProviderAuthError:
+            raise
+        except ProviderError as exc:
+            return {
+                "status": "unavailable",
+                "reason": exc.safe_message,
+                "items": None,
+                "values": None,
+            }
+
+    @staticmethod
+    def _normalize_positions(rows: list[Any]) -> list[dict[str, Any]]:
+        normalized = []
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("trading_symbol"), str):
+                raise ProviderResponseError()
+            normalized.append({
+                "trading_symbol": row["trading_symbol"],
+                "segment": row.get("segment"),
+                "exchange": row.get("exchange"),
+                "product": row.get("product"),
+                "quantity": _signed_count(row.get("quantity")),
+                "net_price": _number(row.get("net_price"), allow_none=True),
+                "net_carry_forward_quantity": _signed_count(
+                    row.get("net_carry_forward_quantity")
+                ),
+                "net_carry_forward_price": _number(
+                    row.get("net_carry_forward_price"), allow_none=True
+                ),
+                "reported_realised_pnl": _number(row.get("realised_pnl"), allow_none=True),
+            })
+        return normalized
+
+    @staticmethod
+    def _normalize_holdings(rows: list[Any]) -> list[dict[str, Any]]:
+        normalized = []
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("trading_symbol"), str):
+                raise ProviderResponseError()
+            normalized.append({
+                "trading_symbol": row["trading_symbol"],
+                "quantity": _count(row.get("quantity")),
+                "average_price": _number(row.get("average_price"), allow_none=True),
+                "pledge_quantity": _number(row.get("pledge_quantity"), allow_none=True),
+                "t1_quantity": _number(row.get("t1_quantity"), allow_none=True),
+            })
+        return normalized
+
+    @staticmethod
+    def _normalize_balances(payload: dict[str, Any]) -> dict[str, float | None]:
+        def value(container: dict[str, Any], field: str) -> float | None:
+            return _number(container.get(field), allow_none=True)
+
+        fno = payload.get("fno_margin_details")
+        equity = payload.get("equity_margin_details")
+        fno = fno if isinstance(fno, dict) else {}
+        equity = equity if isinstance(equity, dict) else {}
+        return {
+            "clear_cash": value(payload, "clear_cash"),
+            "net_margin_used": value(payload, "net_margin_used"),
+            "collateral_available": value(payload, "collateral_available"),
+            "future_balance_available": value(fno, "future_balance_available"),
+            "option_buy_balance_available": value(fno, "option_buy_balance_available"),
+            "option_sell_balance_available": value(fno, "option_sell_balance_available"),
+            "cnc_balance_available": value(equity, "cnc_balance_available"),
+            "mis_balance_available": value(equity, "mis_balance_available"),
+        }
+
+    @staticmethod
+    def _combine_position_sections(fno: dict, cash: dict) -> dict[str, Any]:
+        if fno["status"] == "unavailable" and cash["status"] == "unavailable":
+            return {
+                "status": "unavailable",
+                "reason": "Positions unavailable for both FNO and CASH segments.",
+                "items": None,
+            }
+        items = []
+        for section, segment in ((fno, "FNO"), (cash, "CASH")):
+            if section["status"] == "available":
+                items.extend({**row, "segment": row.get("segment") or segment} for row in section["items"])
+        return {
+            "status": "available" if fno["status"] == cash["status"] else "partial",
+            "reason": None if fno["status"] == cash["status"] else "One positions segment is unavailable.",
+            "items": items,
+        }
 
 
 def _option_quote(raw: Any) -> OptionQuote | None:

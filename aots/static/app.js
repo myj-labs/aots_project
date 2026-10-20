@@ -5,7 +5,11 @@ let entryRequestActive = false;
 async function api(path, options={}) {
   const res = await fetch(path,{headers:{"Content-Type":"application/json"},...options});
   const body = await res.json().catch(()=>({detail:"Unexpected response"}));
-  if(!res.ok) throw new Error(errorText(body.detail) || `Request failed (${res.status})`);
+  if(!res.ok) {
+    const err = new Error(errorText(body.detail) || `Request failed (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
   return body;
 }
 function errorText(detail) {
@@ -180,6 +184,7 @@ function clearProviderInputs() {
 function renderProviderStatus(s) {
   $("provider-status").textContent = PROVIDER_LABELS[s.state] || "Unknown";
   $("provider-status").dataset.state = s.state;
+  $("account-connection-state").textContent = PROVIDER_LABELS[s.state] || "Unknown";
   const detail = s.failure_reason ? ` ${s.failure_reason}` : "";
   $("provider-message").textContent = (PROVIDER_LABELS[s.state] || "") + "." + detail;
   $("provider-message").className = s.state === "failed" ? "negative" : "muted";
@@ -213,3 +218,102 @@ $("provider-disconnect").addEventListener("click", async () => {
   catch(err) { $("provider-message").textContent = err.message; $("provider-message").className = "negative"; }
 });
 loadProviderStatus();
+
+let accountRefreshGeneration = 0;
+let accountRefreshInProgress = false;
+let lastAccountRefreshAt = null;
+
+const optionalMoney = value => value == null ? "Unavailable" : inr(value);
+function setAccountRows(id, colspan, section, renderRow, emptyText) {
+  const body = $(id);
+  if(section.status === "unavailable" || !Array.isArray(section.items)) {
+    body.innerHTML = `<tr><td colspan="${colspan}" class="negative">${escapeHtml(section.reason || "Data unavailable.")}</td></tr>`;
+    return;
+  }
+  if(!section.items.length) {
+    body.innerHTML = `<tr><td colspan="${colspan}" class="muted">${emptyText}</td></tr>`;
+    return;
+  }
+  body.innerHTML = section.items.map(renderRow).join("");
+}
+function renderAccountInsights(data) {
+  const positions = data.positions || {status:"unavailable",reason:"Positions unavailable.",items:null};
+  const openPositions = Array.isArray(positions.items) ?
+    positions.items.filter(row => row.quantity != null && row.quantity !== 0) : null;
+  const visiblePositions = openPositions === null ? positions :
+    {...positions, items:openPositions};
+  setAccountRows("groww-positions", 7, visiblePositions, row =>
+    `<tr><td>${escapeHtml(row.trading_symbol || "Unavailable")}</td><td>${escapeHtml(row.segment || "Unavailable")}</td><td>${escapeHtml(row.exchange || "Unavailable")}</td><td>${escapeHtml(row.product || "Unavailable")}</td><td>${row.quantity == null ? "Unavailable" : Number(row.quantity)}</td><td>${optionalMoney(row.net_price)}</td><td>${optionalMoney(row.reported_realised_pnl)}</td></tr>`,
+    "No open Groww positions.");
+  setAccountRows("groww-holdings", 5, data.holdings || {}, row =>
+    `<tr><td>${escapeHtml(row.trading_symbol || "Unavailable")}</td><td>${row.quantity == null ? "Unavailable" : Number(row.quantity)}</td><td>${optionalMoney(row.average_price)}</td><td>${optionalMoney(row.pledge_quantity)}</td><td>${optionalMoney(row.t1_quantity)}</td></tr>`,
+    "No Groww holdings.");
+
+  const balances = data.balances || {};
+  const balanceValues = balances.values || {};
+  $("groww-clear-cash").textContent = balances.status === "available" ?
+    optionalMoney(balanceValues.clear_cash) : "Unavailable";
+  $("groww-collateral").textContent = balances.status === "available" ?
+    optionalMoney(balanceValues.collateral_available) : "Unavailable";
+  const todayPnl = data.today_pnl || {};
+  $("groww-today-pnl").textContent = todayPnl.status === "available" ?
+    optionalMoney(todayPnl.value) : "Unavailable";
+  $("groww-today-pnl-reason").textContent = todayPnl.reason ||
+    (todayPnl.status === "available" ? "Groww-reported value." : "Today's P&L is unavailable.");
+
+  const sections = [
+    ["positions", positions],
+    ["holdings", data.holdings || {}],
+    ["balances", balances],
+  ];
+  const unavailableCount = sections.filter(([, section]) => section.status !== "available").length;
+  const partial = unavailableCount > 0;
+  $("account-insights-state").textContent = partial ? "Partially available" : "Refreshed";
+  $("account-insights-state").dataset.state = partial ? "partial" : "available";
+  const reasons = sections
+    .filter(([, section]) => section.status !== "available")
+    .map(([name, section]) => `${name}: ${section.reason || "unavailable"}`);
+  $("account-insights-message").textContent = reasons.length ?
+    `Some account data is unavailable: ${reasons.join(" ")}` :
+    "Groww account data refreshed. This is not AOTS paper-trade data.";
+  $("account-insights-message").className = partial ? "negative" : "muted";
+  lastAccountRefreshAt = data.refreshed_at || null;
+  $("account-refresh-time").textContent = lastAccountRefreshAt ?
+    `Last successful refresh: ${kolkataTime(lastAccountRefreshAt)}` :
+    "Last successful refresh: timestamp unavailable";
+}
+
+async function refreshAccountInsights() {
+  if(accountRefreshInProgress) return;
+  accountRefreshInProgress = true;
+  const generation = ++accountRefreshGeneration;
+  const button = $("account-insights-refresh");
+  button.disabled = true;
+  $("account-insights-state").textContent = "Loading";
+  $("account-insights-state").dataset.state = "loading";
+  $("account-insights-message").textContent = "Loading Groww account data…";
+  $("account-insights-message").className = "muted";
+  try {
+    const data = await api("/api/provider/account-insights");
+    if(generation !== accountRefreshGeneration) return;
+    renderAccountInsights(data);
+  } catch(err) {
+    if(generation !== accountRefreshGeneration) return;
+    $("account-insights-state").textContent = err.status === 401 ?
+      "Session expired" : "Refresh failed";
+    $("account-insights-state").dataset.state = err.status === 401 ?
+      "expired" : "error";
+    const priorTime = lastAccountRefreshAt ?
+      ` Last successful data is from ${kolkataTime(lastAccountRefreshAt)} and is stale.` :
+      " No account snapshot is available.";
+    $("account-insights-message").textContent = `${err.message}.${priorTime}`;
+    $("account-insights-message").className = "negative";
+    if(err.status === 401) loadProviderStatus();
+  } finally {
+    if(generation === accountRefreshGeneration) {
+      accountRefreshInProgress = false;
+      button.disabled = false;
+    }
+  }
+}
+$("account-insights-refresh").addEventListener("click", refreshAccountInsights);
