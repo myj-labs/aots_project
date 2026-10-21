@@ -7,6 +7,7 @@ from datetime import date, datetime, time, timedelta
 import pandas as pd
 import pytest
 
+import aots.backtest.__main__ as backtest_cli
 import aots.backtest.data as backtest_data
 from aots.backtest.data import (
     BacktestConfig,
@@ -271,6 +272,32 @@ def test_offline_cache_rejects_incompatible_manifest_and_request(tmp_path):
         load_or_download(config, offline=True, clock=lambda: FIXED_NOW)
 
 
+def test_legacy_manifest_without_validation_binding_cannot_be_reused(tmp_path):
+    config = make_config(tmp_path)
+    bars, metadata = create_cached(config)
+    quality = validate_bars(bars, config, metadata).quality
+    manifest_path = config.data_dir / f"{config.cache_stem}.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for field in (
+        "manifest_schema_version",
+        "cache_schema_version",
+        "retrieval_id",
+        "validated_csv_sha256",
+        "validated_original_download_sha256",
+        "validated_retrieval_id",
+    ):
+        manifest.pop(field, None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert manifest["validation_status"] == "passed"
+    assert manifest["csv_sha256"]
+    assert manifest["original_download_sha256"]
+    with pytest.raises(DataAcquisitionError, match="(?i)legacy.*refresh and validate"):
+        load_or_download(config, offline=True, clock=lambda: FIXED_NOW)
+    with pytest.raises(DataAcquisitionError, match="(?i)legacy.*refresh and validate"):
+        finalize_cache_validation(config, quality)
+
+
 @pytest.mark.parametrize("validation_status", ["missing", "failed"])
 def test_offline_cache_requires_successful_validation(validation_status, tmp_path):
     config = make_config(tmp_path)
@@ -399,6 +426,90 @@ def test_session_calendar_classifies_holiday_special_regular_and_unresolved(tmp_
     assert missing["2026-10-19"] == "configured_exchange_holiday"
     assert missing["2026-10-22"] == "unresolved_holiday_special_session_or_provider_gap"
     assert "not presumed holidays" in result.quality["calendar_note"]
+
+
+def test_missing_configured_regular_session_fails_quality_gate(tmp_path):
+    config = make_config(
+        tmp_path,
+        start=date(2026, 10, 20),
+        end=date(2026, 10, 22),
+        session_calendar=tmp_path / "calendar.json",
+    )
+    config.session_calendar.write_text(
+        json.dumps({"regular_sessions": ["2026-10-20", "2026-10-21"]}),
+        encoding="utf-8",
+    )
+
+    result = validate_bars(make_session(SESSION_DATE), config)
+
+    assert result.quality["eligible_sessions"] == ["2026-10-20"]
+    assert result.quality["passed"] is False
+    missing = {
+        item["date"]: item["classification"]
+        for item in result.quality["missing_session_classifications"]
+    }
+    assert missing["2026-10-21"] == "configured_regular_session_provider_gap"
+    assert any("2026-10-21" in error and "no data" in error for error in result.quality["errors"])
+
+
+def test_configured_regular_date_outside_requested_range_does_not_fail_gate(tmp_path):
+    config = make_config(
+        tmp_path,
+        start=date(2026, 10, 20),
+        end=date(2026, 10, 22),
+        session_calendar=tmp_path / "calendar.json",
+    )
+    config.session_calendar.write_text(
+        json.dumps({"regular_sessions": ["2026-10-20", "2026-10-23"]}),
+        encoding="utf-8",
+    )
+
+    result = validate_bars(make_session(SESSION_DATE), config)
+
+    assert result.quality["passed"] is True
+    assert result.quality["eligible_sessions"] == ["2026-10-20"]
+    assert all(
+        item["date"] != "2026-10-23"
+        for item in result.quality["missing_session_classifications"]
+    )
+
+
+def test_cli_stops_on_missing_configured_regular_session_and_clears_old_results(
+    tmp_path,
+    monkeypatch,
+):
+    config = make_config(tmp_path)
+    create_cached(config)
+    _, prior_data = validated(make_session(), tmp_path)
+    write_results(config, prior_data, run_backtest(prior_data, config))
+    calendar_path = tmp_path / "calendar.json"
+    calendar_path.write_text(
+        json.dumps({"regular_sessions": ["2026-10-20", "2026-10-21"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        backtest_cli,
+        "run_backtest",
+        lambda *_args, **_kwargs: pytest.fail("quality failure must prevent performance backtest"),
+    )
+
+    exit_code = backtest_cli.main([
+        "--start", "2026-10-19",
+        "--end", "2026-10-22",
+        "--offline",
+        "--data-dir", str(config.data_dir),
+        "--output-dir", str(config.output_dir),
+        "--session-calendar", str(calendar_path),
+    ])
+
+    assert exit_code == 2
+    metrics = json.loads((config.output_dir / "orb_metrics.json").read_text(encoding="utf-8"))
+    assert metrics["backtest_run"] is False
+    assert "2026-10-21" in " ".join(metrics["errors"])
+    assert len(pd.read_csv(config.output_dir / "orb_trades.csv")) == 0
+    assert len(pd.read_csv(config.output_dir / "orb_signals.csv")) == 0
+    report = (config.output_dir / "orb_backtest_report.md").read_text(encoding="utf-8")
+    assert "No performance results were generated for this run." in report
 
 
 def test_invalid_session_calendar_fails_quality_gate(tmp_path):

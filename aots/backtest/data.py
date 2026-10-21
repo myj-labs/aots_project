@@ -396,18 +396,20 @@ def load_or_download(
         if not isinstance(metadata, dict):
             raise DataAcquisitionError("The cached manifest has an unsupported structure; download it again.")
         manifest_version, cache_version = _manifest_compatibility(metadata)
+        if manifest_version != MANIFEST_SCHEMA_VERSION:
+            raise DataAcquisitionError(
+                "Legacy cache manifest lacks validation binding; refresh and validate the cache "
+                "before offline reuse."
+            )
         if metadata.get("request") != request or metadata.get("source") != "Yahoo Finance via yfinance":
             raise DataAcquisitionError("Cached data does not match the requested ticker, interval, and date range.")
-        if manifest_version == MANIFEST_SCHEMA_VERSION and metadata.get("instrument") != config.ticker:
+        if metadata.get("instrument") != config.ticker:
             raise DataAcquisitionError("Cache instrument metadata does not match the requested ticker.")
         if metadata.get("validation_status") != "passed":
             raise DataAcquisitionError("Cached data has not passed validation; download and validate it first.")
         if (
-            manifest_version == MANIFEST_SCHEMA_VERSION
-            and (
-                not isinstance(metadata.get("retrieval_id"), str)
-                or not metadata.get("retrieval_id")
-            )
+            not isinstance(metadata.get("retrieval_id"), str)
+            or not metadata.get("retrieval_id")
         ):
             raise DataAcquisitionError("Cache provenance is incomplete; refresh the cache.")
         if metadata.get("csv_sha256") != _file_sha256(csv_path):
@@ -450,13 +452,10 @@ def load_or_download(
             ):
                 raise DataAcquisitionError("Cached timestamp range does not match its manifest.")
         if (
-            manifest_version == MANIFEST_SCHEMA_VERSION
-            and (
-                metadata.get("validated_csv_sha256") != metadata.get("csv_sha256")
-                or metadata.get("validated_original_download_sha256")
-                != metadata.get("original_download_sha256")
-                or metadata.get("validated_retrieval_id") != metadata.get("retrieval_id")
-            )
+            metadata.get("validated_csv_sha256") != metadata.get("csv_sha256")
+            or metadata.get("validated_original_download_sha256")
+            != metadata.get("original_download_sha256")
+            or metadata.get("validated_retrieval_id") != metadata.get("retrieval_id")
         ):
             raise DataAcquisitionError("Cache validation is not bound to the current cached data.")
         metadata = {
@@ -464,11 +463,7 @@ def load_or_download(
             "retrieval_mode": "offline cached reuse",
             "manifest_schema_version": manifest_version,
             "cache_schema_version": cache_version,
-            "cache_provenance": (
-                "legacy manifest verified by request and checksums"
-                if manifest_version == 0
-                else "versioned manifest"
-            ),
+            "cache_provenance": "versioned manifest",
             "cache_integrity_status": "verified",
             "cache_age_seconds": age.total_seconds(),
             "cache_age_days": age_days,
@@ -583,6 +578,10 @@ def finalize_cache_validation(
     if not isinstance(metadata, dict):
         raise DataAcquisitionError("Downloaded cache manifest has an unsupported structure.")
     manifest_version, _ = _manifest_compatibility(metadata)
+    if manifest_version != MANIFEST_SCHEMA_VERSION:
+        raise DataAcquisitionError(
+            "Legacy cache manifest cannot be revalidated in place; refresh and validate the cache."
+        )
     request = {
         "ticker": config.ticker,
         "interval": config.interval,
@@ -615,7 +614,7 @@ def finalize_cache_validation(
         raise DataAcquisitionError(
             "Cache changed after validation; validation status was not transferred to different data."
         )
-    if manifest_version == MANIFEST_SCHEMA_VERSION and not metadata.get("retrieval_id"):
+    if not isinstance(metadata.get("retrieval_id"), str) or not metadata.get("retrieval_id"):
         raise DataAcquisitionError("Cache provenance is incomplete; validation status was not saved.")
     metadata["validation_status"] = "passed" if quality.get("passed") else "failed"
     metadata["validation_summary"] = {
@@ -776,9 +775,13 @@ def validate_bars(
         details.append("No complete, valid 09:15–15:30 IST trading sessions were available.")
     weekday_dates_without_bars = []
     missing_session_classifications = []
+    configured_regular_gaps = []
     candidate = config.start
     while candidate < config.end:
-        if candidate.weekday() < 5 and candidate not in grouped:
+        if (
+            (candidate.weekday() < 5 or candidate in session_calendar["regular_sessions"])
+            and candidate not in grouped
+        ):
             weekday_dates_without_bars.append(candidate.isoformat())
             if candidate in session_calendar["holidays"]:
                 classification = "configured_exchange_holiday"
@@ -792,12 +795,21 @@ def validate_bars(
                 "date": candidate.isoformat(),
                 "classification": classification,
             })
+            if classification == "configured_regular_session_provider_gap":
+                configured_regular_gaps.append(candidate.isoformat())
         candidate += timedelta(days=1)
+    if configured_regular_gaps:
+        details.append(
+            "Configured regular session(s) have no data: "
+            f"{', '.join(configured_regular_gaps)}."
+        )
     calendar_note = (
         "Session calendar classifications use the optional user-supplied JSON file when configured. "
         "Otherwise observed dates are checked against the regular 09:15–15:30 Asia/Kolkata schedule, "
-        "and weekdays without rows remain unresolved; they are not presumed holidays or provider failures. "
-        "Special sessions require explicit calendar entries and are excluded from this regular-session strategy."
+        "and weekdays without rows remain unresolved unless explicitly listed as regular sessions, "
+        "which are treated as known provider gaps and fail validation. Missing dates are not presumed "
+        "holidays. Special sessions require explicit calendar entries and are excluded from this "
+        "regular-session strategy."
     )
     has_global_error = bool(
         duplicate_count or off_session_count
@@ -807,6 +819,7 @@ def validate_bars(
             session_date in session_calendar["holidays"]
             for session_date in grouped
         )
+        or bool(configured_regular_gaps)
         or any("strictly chronological" in item or "timezone-naive" in item for item in details)
     )
     validated_bars = [
@@ -836,6 +849,7 @@ def validate_bars(
             or "Insufficient completed candles" in item
             or "Configured session calendar" in item
             or "Configured session calendar assigns" in item
+            or "Configured regular session(s) have no data" in item
         )
     ]
     quality = {
