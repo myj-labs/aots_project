@@ -11,6 +11,7 @@
 - `aots.brokers.base`: read-only broker contract
 - `aots.brokers.groww`: placeholder read-only adapter boundary
 - `aots.database`: SQLite persistence for trades, app state and audit events
+- `aots.backtest`: isolated yfinance acquisition/cache, OHLC quality gate, deterministic underlying-only ORB simulation, and research reports; not imported by the paper-trading runtime
 
 ## P&L semantics
 
