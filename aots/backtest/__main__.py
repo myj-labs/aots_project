@@ -16,7 +16,7 @@ from .data import (
     validate_bars,
 )
 from .engine import UnsupportedFilterError, run_backtest
-from .report import write_data_quality, write_results
+from .report import write_data_quality, write_failure_report, write_results
 
 
 def _date(value: str) -> date:
@@ -62,8 +62,24 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--start", type=_date, default=default_start, help="Inclusive YYYY-MM-DD (default: recent 30 days).")
     parser.add_argument("--end", type=_date, default=default_end, help="Exclusive YYYY-MM-DD.")
     parser.add_argument("--offline", action="store_true", help="Use only the exact matching cached CSV+manifest.")
+    parser.add_argument(
+        "--allow-stale-cache",
+        action="store_true",
+        help="Allow offline reuse beyond --max-cache-age-days; reports label the override.",
+    )
+    parser.add_argument(
+        "--max-cache-age-days",
+        type=_positive_float,
+        default=7.0,
+        help="Maximum cache age for offline reuse before an explicit override is required (default: 7).",
+    )
     parser.add_argument("--data-dir", type=Path, default=Path("data/backtest"))
     parser.add_argument("--output-dir", type=Path, default=Path("reports/backtest"))
+    parser.add_argument(
+        "--session-calendar",
+        type=Path,
+        help="Optional JSON file classifying regular sessions, holidays, and special sessions.",
+    )
     parser.add_argument("--timeout", type=_positive_float, default=15.0)
     parser.add_argument("--retries", type=_nonnegative_int, default=2)
     parser.add_argument("--ema50", action="store_true", help="Run a separate EMA(50) experiment against baseline.")
@@ -76,6 +92,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.allow_stale_cache and not args.offline:
+        parser.error("--allow-stale-cache requires --offline.")
     try:
         config = BacktestConfig(
             start=args.start,
@@ -84,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir,
             timeout_seconds=args.timeout,
             max_retries=args.retries,
+            max_cache_age_days=args.max_cache_age_days,
+            session_calendar=args.session_calendar,
             vwap_filter=args.vwap,
             breakout_volume_filter=args.breakout_volume,
         )
@@ -91,29 +111,52 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
     args.output_dir.mkdir(parents=True, exist_ok=True)
     try:
-        bars, metadata = load_or_download(config, offline=args.offline)
+        bars, metadata = load_or_download(
+            config,
+            offline=args.offline,
+            allow_stale_cache=args.allow_stale_cache,
+        )
     except DataAcquisitionError as exc:
         report = {
             "passed": False,
+            "validation_status": "not_validated",
+            "cache_integrity_status": "not_verified",
+            "cache_freshness_status": "unknown",
+            "cache_age_days": None,
+            "cache_max_age_days": config.max_cache_age_days,
+            "stale_cache_override": False,
             "ticker": config.ticker,
             "interval": config.interval,
             "requested_start": config.start.isoformat(),
             "requested_end_exclusive": config.end.isoformat(),
             "retrieval_mode": "offline cached reuse" if args.offline else "download requested",
+            "actual_first_timestamp": None,
+            "actual_last_timestamp": None,
             "errors": [str(exc)],
             "backtest_run": False,
         }
-        write_data_quality(config.output_dir, report)
+        write_failure_report(config.output_dir, report)
         print(f"Data acquisition stopped: {exc}", file=sys.stderr)
         print(f"Quality report: {config.output_dir / 'orb_data_quality.json'}", file=sys.stderr)
         return 2
 
     validated = validate_bars(bars, config, metadata)
-    finalize_cache_validation(config, validated.quality)
+    try:
+        finalize_cache_validation(config, validated.quality)
+    except DataAcquisitionError as exc:
+        failure = dict(validated.quality)
+        failure["passed"] = False
+        failure["validation_status"] = "not_finalized"
+        failure["backtest_run"] = False
+        failure["errors"] = [*failure.get("errors", []), str(exc)]
+        write_failure_report(config.output_dir, failure)
+        print(f"Cache validation could not be finalized: {exc}", file=sys.stderr)
+        return 2
     validated.quality["backtest_run"] = False
     write_data_quality(config.output_dir, validated.quality)
     if not validated.quality["passed"]:
         print("Historical data failed validation; no backtest was run.", file=sys.stderr)
+        write_failure_report(config.output_dir, validated.quality)
         print(f"Quality report: {config.output_dir / 'orb_data_quality.json'}", file=sys.stderr)
         return 2
     try:
@@ -139,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         failure = dict(validated.quality)
         failure["errors"] = [*failure.get("errors", []), str(exc)]
         failure["backtest_run"] = False
-        write_data_quality(config.output_dir, failure)
+        write_failure_report(config.output_dir, failure)
         print(f"Backtest stopped: {exc}", file=sys.stderr)
         return 2
 

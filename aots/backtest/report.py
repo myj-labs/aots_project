@@ -73,6 +73,48 @@ def write_data_quality(output_dir: Path, report: Mapping[str, Any]) -> Path:
     return path
 
 
+def write_failure_report(output_dir: Path, report: Mapping[str, Any]) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    quality_path = write_data_quality(output_dir, report)
+    metrics_path = output_dir / "orb_metrics.json"
+    _atomic_text(
+        metrics_path,
+        json.dumps({"backtest_run": False, "errors": report.get("errors", [])}, indent=2) + "\n",
+    )
+    _write_csv(output_dir / "orb_signals.csv", [], list(asdict_placeholder_signal()))
+    _write_csv(output_dir / "orb_trades.csv", [], list(asdict_placeholder_trade()))
+    report_path = output_dir / "orb_backtest_report.md"
+    errors = report.get("errors") or ["No performance backtest was run."]
+    lines = [
+        "# NIFTY 50 30-minute Opening Range Breakout — Data validation stopped",
+        "",
+        "**No performance results were generated for this run.**",
+        "",
+        f"- Retrieval mode: {report.get('retrieval_mode', 'unknown')}",
+        f"- Retrieval time (UTC): {report.get('retrieved_at_utc') or 'unavailable'}",
+        f"- Cache freshness: {report.get('cache_freshness_status', 'unknown')}",
+        f"- Cache integrity: {report.get('cache_integrity_status', 'unknown')}",
+        f"- Validation status: {report.get('validation_status', 'failed')}",
+        f"- Requested coverage: {report.get('requested_start', 'unknown')} through "
+        f"{report.get('requested_end_exclusive', 'unknown')} (end exclusive)",
+        f"- Actual coverage: {report.get('actual_first_timestamp') or 'unavailable'} through "
+        f"{report.get('actual_last_timestamp') or 'unavailable'}",
+        "",
+        "## Required action",
+        "",
+    ]
+    lines.extend(f"- {error}" for error in errors)
+    lines.append("")
+    _atomic_text(report_path, "\n".join(lines))
+    return [
+        report_path,
+        output_dir / "orb_trades.csv",
+        output_dir / "orb_signals.csv",
+        quality_path,
+        metrics_path,
+    ]
+
+
 def write_results(
     config: BacktestConfig,
     data: ValidatedData,
@@ -185,9 +227,21 @@ def _build_report(
         f"- Requested: `{config.start.isoformat()}` through `{config.end.isoformat()}` (end exclusive).",
         f"- Actual: `{quality.get('actual_first_timestamp')}` through `{quality.get('actual_last_timestamp')}`; {quality['row_count']} normalized rows.",
         f"- Retrieval: `{data.metadata.get('retrieved_at_utc')}` UTC; mode: `{data.metadata.get('retrieval_mode')}`.",
+        f"- Cache age: `{_display(quality.get('cache_age_days'))}` days; freshness: "
+        f"`{quality.get('cache_freshness_status', 'unknown')}` (configured maximum "
+        f"`{quality.get('cache_max_age_days', config.max_cache_age_days)}` days); stale override used: "
+        f"`{quality.get('stale_cache_override', False)}`.",
+        f"- Cache integrity: `{quality.get('cache_integrity_status', 'unknown')}`; provenance: "
+        f"`{quality.get('cache_provenance', 'unknown')}`; manifest/cache schema: "
+        f"`{quality.get('manifest_schema_version')}/{quality.get('cache_schema_version')}`.",
+        f"- Validation: `{quality.get('validation_status', 'unknown')}`; coverage: "
+        f"`{quality.get('coverage_status', 'unknown')}`; strategy run: "
+        f"`{quality.get('backtest_run', False)}`.",
         f"- Timestamp rule: `{quality['timestamp_convention']}`",
         f"- Quality gate: **{'PASSED' if quality['passed'] else 'FAILED'}**; missing candle count: {quality['missing_candle_count']}; duplicate timestamps: {quality['duplicate_timestamp_count']}; invalid OHLC: {quality['invalid_ohlc_count']}; off-session rows: {quality['off_session_row_count']}.",
         f"- Weekdays in the requested range with no returned data (possibly holidays or provider gaps): {', '.join(quality.get('weekday_dates_without_bars', [])) or 'none'}.",
+        f"- Missing-session classifications: `{json.dumps(quality.get('missing_session_classifications', []), sort_keys=True)}`.",
+        f"- User-supplied session calendar: `{json.dumps(quality.get('session_calendar', {}), sort_keys=True)}`.",
         f"- Calendar limitation: {quality['calendar_note']}",
         "",
         "### Excluded sessions",

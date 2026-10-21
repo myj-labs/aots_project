@@ -7,6 +7,7 @@ from datetime import date, datetime, time, timedelta
 import pandas as pd
 import pytest
 
+import aots.backtest.data as backtest_data
 from aots.backtest.data import (
     BacktestConfig,
     Bar,
@@ -28,7 +29,7 @@ from aots.backtest.engine import (
     calculate_metrics,
     run_backtest,
 )
-from aots.backtest.report import write_results
+from aots.backtest.report import write_failure_report, write_results
 
 
 FIXED_NOW = datetime(2026, 10, 21, 12, 0, tzinfo=KOLKATA)
@@ -36,9 +37,11 @@ SESSION_DATE = date(2026, 10, 20)
 
 
 def make_config(tmp_path, **kwargs):
+    start = kwargs.pop("start", date(2026, 10, 19))
+    end = kwargs.pop("end", date(2026, 10, 22))
     return BacktestConfig(
-        start=date(2026, 10, 19),
-        end=date(2026, 10, 22),
+        start=start,
+        end=end,
         data_dir=tmp_path / "cache",
         output_dir=tmp_path / "reports",
         **kwargs,
@@ -96,6 +99,20 @@ def validated(bars, tmp_path, **config_options):
         {"source": "test fixture", "retrieved_at_utc": FIXED_NOW.isoformat()},
     )
     return config, result
+
+
+def create_cached(config, *, retrieved_at=FIXED_NOW, frame=None):
+    if frame is None:
+        frame = frame_from_bars(make_session())
+    bars, metadata = load_or_download(
+        config,
+        downloader=lambda *_args, **_kwargs: frame,
+        clock=lambda: retrieved_at,
+        sleep=lambda _: None,
+    )
+    quality = validate_bars(bars, config, metadata).quality
+    finalize_cache_validation(config, quality)
+    return bars, metadata
 
 
 def frame_from_bars(bars):
@@ -179,6 +196,256 @@ def test_download_success_persists_provenance_and_offline_cache(tmp_path):
         load_or_download(config, offline=True, clock=lambda: FIXED_NOW)
 
 
+def test_offline_cache_freshness_boundary_and_override(tmp_path):
+    config = make_config(tmp_path, max_cache_age_days=1.0)
+    create_cached(config)
+
+    boundary = FIXED_NOW + timedelta(days=1)
+    _, boundary_metadata = load_or_download(
+        config,
+        offline=True,
+        clock=lambda: boundary,
+    )
+    assert boundary_metadata["cache_freshness_status"] == "fresh"
+    assert boundary_metadata["cache_age_days"] == pytest.approx(1.0)
+    assert boundary_metadata["stale_cache_override"] is False
+
+    stale_now = boundary + timedelta(seconds=1)
+    with pytest.raises(DataAcquisitionError, match="is stale"):
+        load_or_download(config, offline=True, clock=lambda: stale_now)
+    _, stale_metadata = load_or_download(
+        config,
+        offline=True,
+        allow_stale_cache=True,
+        clock=lambda: stale_now,
+    )
+    assert stale_metadata["cache_freshness_status"] == "stale"
+    assert stale_metadata["stale_cache_override"] is True
+    assert stale_metadata["cache_integrity_status"] == "verified"
+
+
+@pytest.mark.parametrize(
+    "retrieved_at",
+    [
+        "not-a-timestamp",
+        "2026-10-20T12:00:00",
+        "2026-10-22T12:00:00+05:30",
+    ],
+)
+def test_offline_cache_rejects_malformed_naive_or_future_retrieval_time(tmp_path, retrieved_at):
+    config = make_config(tmp_path)
+    create_cached(config)
+    manifest_path = config.data_dir / f"{config.cache_stem}.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["retrieved_at_utc"] = retrieved_at
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(DataAcquisitionError, match="retrieval timestamp"):
+        load_or_download(config, offline=True, clock=lambda: FIXED_NOW)
+
+
+def test_offline_cache_rejects_incompatible_manifest_and_request(tmp_path):
+    config = make_config(tmp_path)
+    create_cached(config)
+    manifest_path = config.data_dir / f"{config.cache_stem}.json"
+    original = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    manifest_path.write_text("[]", encoding="utf-8")
+    with pytest.raises(DataAcquisitionError, match="unsupported structure"):
+        load_or_download(config, offline=True, clock=lambda: FIXED_NOW)
+
+    manifest = dict(original, manifest_schema_version=999)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(DataAcquisitionError, match="schema version is incompatible"):
+        load_or_download(config, offline=True, clock=lambda: FIXED_NOW)
+
+    manifest = dict(original, manifest_schema_version=True)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(DataAcquisitionError, match="schema version is incompatible"):
+        load_or_download(config, offline=True, clock=lambda: FIXED_NOW)
+
+    manifest = dict(original)
+    manifest["request"] = dict(original["request"], ticker="OTHER")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(DataAcquisitionError, match="does not match"):
+        load_or_download(config, offline=True, clock=lambda: FIXED_NOW)
+
+
+@pytest.mark.parametrize("validation_status", ["missing", "failed"])
+def test_offline_cache_requires_successful_validation(validation_status, tmp_path):
+    config = make_config(tmp_path)
+    create_cached(config)
+    manifest_path = config.data_dir / f"{config.cache_stem}.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if validation_status == "missing":
+        manifest.pop("validation_status")
+    else:
+        manifest["validation_status"] = validation_status
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(DataAcquisitionError, match="has not passed validation"):
+        load_or_download(config, offline=True, clock=lambda: FIXED_NOW)
+
+
+def test_offline_cache_rejects_normalized_checksum_mismatch(tmp_path):
+    config = make_config(tmp_path)
+    create_cached(config)
+    cache_path = config.data_dir / f"{config.cache_stem}.csv"
+    cache_path.write_text(cache_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    with pytest.raises(DataAcquisitionError, match="Cached data checksum"):
+        load_or_download(config, offline=True, clock=lambda: FIXED_NOW)
+
+
+def test_validation_status_cannot_be_transferred_to_changed_cache(tmp_path):
+    config = make_config(tmp_path)
+    bars, metadata = create_cached(config)
+    quality = validate_bars(bars, config, metadata).quality
+    cache_path = config.data_dir / f"{config.cache_stem}.csv"
+    cache_path.write_text(cache_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    with pytest.raises(DataAcquisitionError, match="changed after validation"):
+        finalize_cache_validation(config, quality)
+
+
+def test_online_mode_attempts_download_and_never_falls_back_to_cache(tmp_path):
+    config = make_config(tmp_path)
+    create_cached(config)
+    calls = []
+
+    def fail_download(*_args, **_kwargs):
+        calls.append(True)
+        raise TimeoutError("private network details")
+
+    with pytest.raises(DataAcquisitionError, match="download failed"):
+        load_or_download(
+            config,
+            downloader=fail_download,
+            clock=lambda: FIXED_NOW,
+            sleep=lambda _: None,
+        )
+    assert calls
+
+
+def test_failed_cache_update_cannot_leave_old_manifest_marking_new_data_valid(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    create_cached(config)
+    frame = frame_from_bars(make_session())
+    frame.iloc[0, frame.columns.get_loc("Close")] += 0.25
+
+    def fail_normalized_write(*_args, **_kwargs):
+        raise OSError("disk write failed")
+
+    monkeypatch.setattr(backtest_data, "_write_cache", fail_normalized_write)
+    with pytest.raises(DataAcquisitionError, match="complete cache"):
+        load_or_download(
+            config,
+            downloader=lambda *_args, **_kwargs: frame,
+            clock=lambda: FIXED_NOW + timedelta(minutes=1),
+            sleep=lambda _: None,
+        )
+    with pytest.raises(DataAcquisitionError, match="Original Yahoo response"):
+        load_or_download(config, offline=True, clock=lambda: FIXED_NOW + timedelta(minutes=1))
+
+
+def test_online_and_offline_retrieval_modes_produce_identical_strategy_results(tmp_path):
+    config = make_config(tmp_path)
+    online_bars, online_metadata = create_cached(config)
+    online_data = validate_or_raise(online_bars, config, online_metadata)
+
+    offline_bars, offline_metadata = load_or_download(
+        config,
+        offline=True,
+        clock=lambda: FIXED_NOW,
+    )
+    offline_data = validate_or_raise(offline_bars, config, offline_metadata)
+
+    online_result = run_backtest(online_data, config)
+    offline_result = run_backtest(offline_data, config)
+    assert online_result.metrics == offline_result.metrics
+    assert online_result.signals == offline_result.signals
+    assert online_result.trades == offline_result.trades
+
+
+def test_session_calendar_classifies_holiday_special_regular_and_unresolved(tmp_path):
+    config = make_config(
+        tmp_path,
+        end=date(2026, 10, 23),
+        session_calendar=tmp_path / "calendar.json",
+    )
+    config.session_calendar.write_text(
+        json.dumps({
+            "source": "manually verified fixture",
+            "holidays": ["2026-10-19"],
+            "special_sessions": ["2026-10-20"],
+            "regular_sessions": ["2026-10-21"],
+        }),
+        encoding="utf-8",
+    )
+    bars = make_session(SESSION_DATE) + make_session(date(2026, 10, 21))
+
+    result = validate_bars(bars, config)
+
+    assert result.quality["passed"] is True
+    assert result.quality["eligible_sessions"] == ["2026-10-21"]
+    details = {row["date"]: row for row in result.quality["session_details"]}
+    assert details["2026-10-20"]["calendar_classification"] == "special_session"
+    assert details["2026-10-20"]["eligible"] is False
+    assert details["2026-10-21"]["calendar_classification"] == "configured_regular_session"
+    missing = {
+        item["date"]: item["classification"]
+        for item in result.quality["missing_session_classifications"]
+    }
+    assert missing["2026-10-19"] == "configured_exchange_holiday"
+    assert missing["2026-10-22"] == "unresolved_holiday_special_session_or_provider_gap"
+    assert "not presumed holidays" in result.quality["calendar_note"]
+
+
+def test_invalid_session_calendar_fails_quality_gate(tmp_path):
+    config = make_config(tmp_path, session_calendar=tmp_path / "calendar.json")
+    config.session_calendar.write_text("{invalid", encoding="utf-8")
+
+    result = validate_bars(make_session(), config)
+
+    assert result.quality["passed"] is False
+    assert any("Configured session calendar is unreadable" in error for error in result.quality["errors"])
+
+
+def test_session_calendar_rejects_duplicate_dates(tmp_path):
+    config = make_config(tmp_path, session_calendar=tmp_path / "calendar.json")
+    config.session_calendar.write_text(
+        json.dumps({"holidays": ["2026-10-19", "2026-10-19"]}),
+        encoding="utf-8",
+    )
+
+    result = validate_bars(make_session(), config)
+
+    assert result.quality["passed"] is False
+    assert any("calendar dates must be ISO" in error for error in result.quality["errors"])
+
+
+def test_failure_report_replaces_stale_performance_artifacts(tmp_path):
+    config, data = validated(make_session(), tmp_path)
+    result = run_backtest(data, config)
+    write_results(config, data, result)
+    failure = {
+        "retrieval_mode": "offline cached reuse",
+        "validation_status": "failed",
+        "cache_freshness_status": "stale",
+        "errors": ["Cached data is stale."],
+    }
+
+    write_failure_report(config.output_dir, failure)
+
+    metrics = json.loads((config.output_dir / "orb_metrics.json").read_text(encoding="utf-8"))
+    assert metrics == {"backtest_run": False, "errors": ["Cached data is stale."]}
+    assert len(pd.read_csv(config.output_dir / "orb_trades.csv")) == 0
+    assert len(pd.read_csv(config.output_dir / "orb_signals.csv")) == 0
+    report = (config.output_dir / "orb_backtest_report.md").read_text(encoding="utf-8")
+    assert "No performance results were generated for this run." in report
+    assert "Cache freshness: stale" in report
+
+
 def test_empty_download_and_network_error_retry_without_fallback(tmp_path):
     config = make_config(tmp_path, max_retries=2)
     calls = []
@@ -259,9 +526,18 @@ def test_offline_missing_mismatch_and_expired_cache(tmp_path):
     old_quality = validate_bars(bars, old, old_metadata).quality
     assert old_quality["passed"] is True
     finalize_cache_validation(old, old_quality)
-    reused, metadata = load_or_download(old, offline=True, clock=lambda: FIXED_NOW)
+    with pytest.raises(DataAcquisitionError, match="is stale"):
+        load_or_download(old, offline=True, clock=lambda: FIXED_NOW)
+    reused, metadata = load_or_download(
+        old,
+        offline=True,
+        allow_stale_cache=True,
+        clock=lambda: FIXED_NOW,
+    )
     assert reused == bars
     assert metadata["retrieval_mode"] == "offline cached reuse"
+    assert metadata["cache_freshness_status"] == "stale"
+    assert metadata["stale_cache_override"] is True
     with pytest.raises(DataAcquisitionError, match="limited to the last 60"):
         load_or_download(old, offline=False, downloader=lambda *_a, **_k: None, clock=lambda: FIXED_NOW)
 

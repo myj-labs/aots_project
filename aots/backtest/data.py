@@ -7,8 +7,9 @@ import math
 import os
 import tempfile
 import time
+import uuid
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, time as local_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -21,6 +22,9 @@ KOLKATA = ZoneInfo("Asia/Kolkata")
 YAHOO_INTRADAY_LIMIT_DAYS = 60
 EXPECTED_OHLC = ("open", "high", "low", "close")
 CSV_FIELDS = ("timestamp", "open", "high", "low", "close", "volume", "volume_invalid")
+MANIFEST_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 1
+DEFAULT_MAX_CACHE_AGE_DAYS = 7.0
 
 
 class DataAcquisitionError(RuntimeError):
@@ -44,6 +48,8 @@ class BacktestConfig:
     timezone_name: str = "Asia/Kolkata"
     timeout_seconds: float = 15.0
     max_retries: int = 2
+    max_cache_age_days: float = DEFAULT_MAX_CACHE_AGE_DAYS
+    session_calendar: Path | None = None
     ema50_filter: bool = False
     opening_range_atr_max_ratio: float | None = None
     vwap_filter: bool = False
@@ -63,6 +69,12 @@ class BacktestConfig:
             raise ValueError("NIFTY 50 session handling requires Asia/Kolkata.")
         if self.timeout_seconds <= 0 or self.max_retries < 0:
             raise ValueError("Timeout must be positive and retries must be non-negative.")
+        if (
+            isinstance(self.max_cache_age_days, bool)
+            or not math.isfinite(self.max_cache_age_days)
+            or self.max_cache_age_days <= 0
+        ):
+            raise ValueError("Maximum cache age must be a positive number of days.")
         if self.opening_range_atr_max_ratio is not None and self.opening_range_atr_max_ratio <= 0:
             raise ValueError("The opening-range/ATR ratio must be positive.")
         if self.max_trades_per_session < 1:
@@ -219,6 +231,107 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _utc_timestamp(value: Any, *, label: str) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise DataAcquisitionError(f"{label} must be a timezone-aware timestamp.")
+    return value.astimezone(timezone.utc)
+
+
+def _parse_manifest_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise DataAcquisitionError("Cache retrieval timestamp is missing or malformed.")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise DataAcquisitionError("Cache retrieval timestamp is malformed.") from None
+    return _utc_timestamp(parsed, label="Cache retrieval timestamp")
+
+
+def _manifest_compatibility(metadata: Mapping[str, Any]) -> tuple[int, int]:
+    manifest_version = metadata.get("manifest_schema_version", 0)
+    cache_version = metadata.get("cache_schema_version", 0)
+    if (
+        not isinstance(manifest_version, int)
+        or isinstance(manifest_version, bool)
+        or not isinstance(cache_version, int)
+        or isinstance(cache_version, bool)
+        or manifest_version < 0
+        or cache_version < 0
+        or manifest_version > MANIFEST_SCHEMA_VERSION
+        or cache_version > CACHE_SCHEMA_VERSION
+    ):
+        raise DataAcquisitionError("Cache manifest or CSV schema version is incompatible; refresh the cache.")
+    if manifest_version == MANIFEST_SCHEMA_VERSION and cache_version != CACHE_SCHEMA_VERSION:
+        raise DataAcquisitionError("Cache manifest and CSV schema versions do not match.")
+    return manifest_version, cache_version
+
+
+def _load_session_calendar(path: Path | None) -> tuple[dict[str, set[date]], str | None, str | None]:
+    if path is None:
+        return {"holidays": set(), "special_sessions": set(), "regular_sessions": set()}, None, None
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return (
+            {"holidays": set(), "special_sessions": set(), "regular_sessions": set()},
+            None,
+            "Configured session calendar is unreadable; use a valid JSON calendar file.",
+        )
+    if not isinstance(payload, dict) or set(payload) - {
+        "source",
+        "holidays",
+        "special_sessions",
+        "regular_sessions",
+    }:
+        return (
+            {"holidays": set(), "special_sessions": set(), "regular_sessions": set()},
+            hashlib.sha256(raw).hexdigest(),
+            "Configured session calendar has an unsupported schema.",
+        )
+    parsed: dict[str, set[date]] = {}
+    try:
+        for key in ("holidays", "special_sessions", "regular_sessions"):
+            values = payload.get(key, [])
+            if not isinstance(values, list):
+                raise ValueError
+            dates = set()
+            for value in values:
+                if not isinstance(value, str):
+                    raise ValueError
+                parsed_date = date.fromisoformat(value)
+                if parsed_date.isoformat() != value:
+                    raise ValueError
+                dates.add(parsed_date)
+            if len(dates) != len(values):
+                raise ValueError
+            parsed[key] = dates
+    except ValueError:
+        return (
+            {"holidays": set(), "special_sessions": set(), "regular_sessions": set()},
+            hashlib.sha256(raw).hexdigest(),
+            "Configured session calendar dates must be ISO YYYY-MM-DD arrays.",
+        )
+    if (
+        parsed["holidays"] & parsed["special_sessions"]
+        or parsed["holidays"] & parsed["regular_sessions"]
+        or parsed["special_sessions"] & parsed["regular_sessions"]
+    ):
+        return (
+            parsed,
+            hashlib.sha256(raw).hexdigest(),
+            "Configured session calendar assigns conflicting classifications to a date.",
+        )
+    source = payload.get("source")
+    if source is not None and not isinstance(source, str):
+        return (
+            parsed,
+            hashlib.sha256(raw).hexdigest(),
+            "Configured session calendar source must be a string.",
+        )
+    return parsed, hashlib.sha256(raw).hexdigest(), None
+
+
 def _write_cache(csv_path: Path, bars: Iterable[Bar]) -> None:
     def write(handle: Any) -> None:
         writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
@@ -240,11 +353,22 @@ def load_or_download(
     config: BacktestConfig,
     *,
     offline: bool = False,
+    allow_stale_cache: bool = False,
     downloader: Callable[..., Any] | None = None,
     clock: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[list[Bar], dict[str, Any]]:
-    now = (clock or (lambda: datetime.now(timezone.utc)))().astimezone(timezone.utc)
+    try:
+        now = _utc_timestamp(
+            (clock or (lambda: datetime.now(timezone.utc)))(),
+            label="Clock",
+        )
+    except DataAcquisitionError:
+        raise
+    except Exception:
+        raise DataAcquisitionError("Clock did not provide a valid UTC timestamp.") from None
+    if allow_stale_cache and not offline:
+        raise DataAcquisitionError("Stale-cache override is only available with offline mode.")
     age_days = (now.astimezone(KOLKATA).date() - config.start).days
     if not offline and age_days > YAHOO_INTRADAY_LIMIT_DAYS:
         raise DataAcquisitionError(
@@ -267,18 +391,32 @@ def load_or_download(
             raise DataAcquisitionError("Offline mode requested, but no matching cached data and manifest exist.")
         try:
             metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             raise DataAcquisitionError("The cached metadata is unreadable; download the data again.") from None
+        if not isinstance(metadata, dict):
+            raise DataAcquisitionError("The cached manifest has an unsupported structure; download it again.")
+        manifest_version, cache_version = _manifest_compatibility(metadata)
         if metadata.get("request") != request or metadata.get("source") != "Yahoo Finance via yfinance":
             raise DataAcquisitionError("Cached data does not match the requested ticker, interval, and date range.")
+        if manifest_version == MANIFEST_SCHEMA_VERSION and metadata.get("instrument") != config.ticker:
+            raise DataAcquisitionError("Cache instrument metadata does not match the requested ticker.")
         if metadata.get("validation_status") != "passed":
             raise DataAcquisitionError("Cached data has not passed validation; download and validate it first.")
+        if (
+            manifest_version == MANIFEST_SCHEMA_VERSION
+            and (
+                not isinstance(metadata.get("retrieval_id"), str)
+                or not metadata.get("retrieval_id")
+            )
+        ):
+            raise DataAcquisitionError("Cache provenance is incomplete; refresh the cache.")
         if metadata.get("csv_sha256") != _file_sha256(csv_path):
             raise DataAcquisitionError("Cached data checksum does not match its manifest; download it again.")
         raw_name = metadata.get("original_download_csv")
         raw_path = config.data_dir / raw_name if isinstance(raw_name, str) else None
         if (
             raw_path is None
+            or raw_path.name != f"{config.cache_stem}.yahoo.csv"
             or not raw_path.is_file()
             or metadata.get("original_download_sha256") != _file_sha256(raw_path)
         ):
@@ -287,7 +425,57 @@ def load_or_download(
             bars = _read_cache(csv_path)
         except (OSError, KeyError, ValueError, TypeError):
             raise DataAcquisitionError("Cached CSV data is unreadable; download it again.") from None
-        metadata = {**metadata, "retrieval_mode": "offline cached reuse"}
+        retrieval_time = _parse_manifest_timestamp(metadata.get("retrieved_at_utc"))
+        if retrieval_time > now:
+            raise DataAcquisitionError("Cache retrieval timestamp is in the future; check the system clock.")
+        age = now - retrieval_time
+        age_days = age.total_seconds() / 86400
+        stale = age_days > config.max_cache_age_days
+        if stale and not allow_stale_cache:
+            raise DataAcquisitionError(
+                f"Cached data is stale ({age_days:.2f} days old; maximum is "
+                f"{config.max_cache_age_days:g} days). Use --allow-stale-cache with --offline "
+                "to explicitly reuse it."
+            )
+        if (
+            not isinstance(metadata.get("row_count"), int)
+            or isinstance(metadata.get("row_count"), bool)
+            or metadata.get("row_count") != len(bars)
+        ):
+            raise DataAcquisitionError("Cached row count does not match its manifest.")
+        if bars:
+            if (
+                metadata.get("actual_first_timestamp_ist") != bars[0].timestamp.isoformat()
+                or metadata.get("actual_last_timestamp_ist") != bars[-1].timestamp.isoformat()
+            ):
+                raise DataAcquisitionError("Cached timestamp range does not match its manifest.")
+        if (
+            manifest_version == MANIFEST_SCHEMA_VERSION
+            and (
+                metadata.get("validated_csv_sha256") != metadata.get("csv_sha256")
+                or metadata.get("validated_original_download_sha256")
+                != metadata.get("original_download_sha256")
+                or metadata.get("validated_retrieval_id") != metadata.get("retrieval_id")
+            )
+        ):
+            raise DataAcquisitionError("Cache validation is not bound to the current cached data.")
+        metadata = {
+            **metadata,
+            "retrieval_mode": "offline cached reuse",
+            "manifest_schema_version": manifest_version,
+            "cache_schema_version": cache_version,
+            "cache_provenance": (
+                "legacy manifest verified by request and checksums"
+                if manifest_version == 0
+                else "versioned manifest"
+            ),
+            "cache_integrity_status": "verified",
+            "cache_age_seconds": age.total_seconds(),
+            "cache_age_days": age_days,
+            "cache_max_age_days": config.max_cache_age_days,
+            "cache_freshness_status": "stale" if stale else "fresh",
+            "stale_cache_override": stale and allow_stale_cache,
+        }
         return bars, metadata
 
     if downloader is None:
@@ -325,23 +513,25 @@ def load_or_download(
             sleep(min(2 ** attempt, 4))
     if frame is None or getattr(frame, "empty", False):
         raise DataAcquisitionError(last_error)
+    try:
+        bars, timestamp_convention = normalize_frame(frame, config.ticker)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise DataAcquisitionError(f"Yahoo Finance response could not be normalized: {exc}.") from None
+    if not bars:
+        raise DataAcquisitionError("Yahoo Finance response contained no usable OHLC rows.")
     raw_path = config.data_dir / f"{config.cache_stem}.yahoo.csv"
     try:
         _atomic_write(raw_path, lambda handle: frame.to_csv(handle))
     except Exception:
         raise DataAcquisitionError("Yahoo Finance returned data, but the raw response could not be cached safely.") from None
-    try:
-        bars, timestamp_convention = normalize_frame(frame, config.ticker)
-    except (TypeError, ValueError, KeyError) as exc:
-        raise DataAcquisitionError(
-            f"Yahoo Finance response could not be normalized: {exc}; original rows are preserved at {raw_path}."
-        ) from None
-    if not bars:
-        raise DataAcquisitionError("Yahoo Finance response contained no usable OHLC rows.")
     retrieved_at = now.isoformat()
     timestamps = [bar.timestamp.isoformat() for bar in bars]
     metadata = {
+        "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "retrieval_id": uuid.uuid4().hex,
         "source": "Yahoo Finance via yfinance",
+        "instrument": config.ticker,
         "request": request,
         "retrieved_at_utc": retrieved_at,
         "actual_first_timestamp_ist": timestamps[0],
@@ -359,9 +549,23 @@ def load_or_download(
         "yfinance_version": _package_version("yfinance"),
         "retrieval_mode": "downloaded now",
     }
-    _write_cache(csv_path, bars)
-    metadata["csv_sha256"] = _file_sha256(csv_path)
-    _write_json(manifest_path, metadata)
+    try:
+        _write_cache(csv_path, bars)
+        metadata["csv_sha256"] = _file_sha256(csv_path)
+        metadata.update({
+            "cache_integrity_status": "verified",
+            "cache_age_seconds": 0.0,
+            "cache_age_days": 0.0,
+            "cache_max_age_days": config.max_cache_age_days,
+            "cache_freshness_status": "fresh",
+            "stale_cache_override": False,
+            "cache_provenance": "downloaded in this run",
+        })
+        _write_json(manifest_path, metadata)
+    except OSError:
+        raise DataAcquisitionError(
+            "Downloaded data could not be committed as a complete cache; refresh and validate it again."
+        ) from None
     return bars, metadata
 
 
@@ -371,11 +575,48 @@ def finalize_cache_validation(
 ) -> None:
     manifest_path = config.data_dir / f"{config.cache_stem}.json"
     if not manifest_path.is_file():
-        return
+        raise DataAcquisitionError("Cache manifest is missing; validation status was not saved.")
     try:
         metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise DataAcquisitionError("Downloaded cache manifest could not be finalized.") from None
+    if not isinstance(metadata, dict):
+        raise DataAcquisitionError("Downloaded cache manifest has an unsupported structure.")
+    manifest_version, _ = _manifest_compatibility(metadata)
+    request = {
+        "ticker": config.ticker,
+        "interval": config.interval,
+        "start": config.start.isoformat(),
+        "end_exclusive": config.end.isoformat(),
+        "timezone": config.timezone_name,
+    }
+    if metadata.get("request") != request:
+        raise DataAcquisitionError("Cache request changed before validation could be finalized.")
+    csv_path = config.data_dir / f"{config.cache_stem}.csv"
+    original_name = metadata.get("original_download_csv")
+    if (
+        not isinstance(original_name, str)
+        or Path(original_name).name != f"{config.cache_stem}.yahoo.csv"
+    ):
+        raise DataAcquisitionError("Cache provenance is incomplete; validation status was not saved.")
+    original_path = config.data_dir / original_name
+    try:
+        csv_hash = _file_sha256(csv_path)
+        original_hash = _file_sha256(original_path)
+    except OSError:
+        raise DataAcquisitionError("Cache files are missing; validation status was not saved.") from None
+    if (
+        csv_hash != metadata.get("csv_sha256")
+        or original_hash != metadata.get("original_download_sha256")
+        or quality.get("cache_csv_sha256") != csv_hash
+        or quality.get("cache_original_download_sha256") != original_hash
+        or quality.get("cache_retrieval_id") != metadata.get("retrieval_id")
+    ):
+        raise DataAcquisitionError(
+            "Cache changed after validation; validation status was not transferred to different data."
+        )
+    if manifest_version == MANIFEST_SCHEMA_VERSION and not metadata.get("retrieval_id"):
+        raise DataAcquisitionError("Cache provenance is incomplete; validation status was not saved.")
     metadata["validation_status"] = "passed" if quality.get("passed") else "failed"
     metadata["validation_summary"] = {
         "eligible_session_count": quality.get("eligible_session_count", 0),
@@ -383,9 +624,11 @@ def finalize_cache_validation(
         "duplicate_timestamp_count": quality.get("duplicate_timestamp_count", 0),
         "invalid_ohlc_count": quality.get("invalid_ohlc_count", 0),
         "off_session_row_count": quality.get("off_session_row_count", 0),
-        "invalid_ohlc_count": quality.get("invalid_ohlc_count", 0),
         "invalid_volume_count": quality.get("invalid_volume_count", 0),
     }
+    metadata["validated_csv_sha256"] = csv_hash
+    metadata["validated_original_download_sha256"] = original_hash
+    metadata["validated_retrieval_id"] = metadata.get("retrieval_id")
     _write_json(manifest_path, metadata)
 
 
@@ -403,6 +646,11 @@ def validate_bars(
     metadata: Mapping[str, Any] | None = None,
 ) -> ValidatedData:
     details: list[str] = []
+    session_calendar, calendar_sha256, calendar_error = _load_session_calendar(
+        config.session_calendar
+    )
+    if calendar_error:
+        details.append(calendar_error)
     duplicate_count = 0
     invalid_ohlc_count = 0
     invalid_volume_count = sum(1 for bar in bars if bar.volume_invalid)
@@ -463,13 +711,32 @@ def validate_bars(
     excluded_dates: list[dict[str, str]] = []
     missing_total = 0
     for session_date, rows in sorted(grouped.items()):
+        calendar_type = (
+            "holiday" if session_date in session_calendar["holidays"]
+            else "special_session" if session_date in session_calendar["special_sessions"]
+            else "configured_regular_session"
+            if session_date in session_calendar["regular_sessions"]
+            else "observed_session_calendar_unconfirmed"
+        )
         by_time: dict[local_time, list[Bar]] = defaultdict(list)
         for row in rows:
             by_time[row.timestamp.astimezone(KOLKATA).time()].append(row)
-        missing = [at.strftime("%H:%M") for at in expected_times if len(by_time[at]) == 0]
-        repeated = [at.strftime("%H:%M") for at in expected_times if len(by_time[at]) > 1]
+        missing = (
+            []
+            if calendar_type in {"holiday", "special_session"}
+            else [at.strftime("%H:%M") for at in expected_times if len(by_time[at]) == 0]
+        )
+        repeated = (
+            []
+            if calendar_type in {"holiday", "special_session"}
+            else [at.strftime("%H:%M") for at in expected_times if len(by_time[at]) > 1]
+        )
         missing_total += len(missing)
         reasons = []
+        if calendar_type == "holiday":
+            reasons.append("provider returned rows for a date configured as an exchange holiday")
+        if calendar_type == "special_session":
+            reasons.append("special session excluded; regular-session ORB schedule is not applicable")
         if session_date in invalid_dates:
             reasons.append("session contains invalid or missing OHLC values")
         if missing:
@@ -486,7 +753,8 @@ def validate_bars(
             for row in opening
         )
         if (
-            len(opening) == 6
+            calendar_type not in {"holiday", "special_session"}
+            and len(opening) == 6
             and opening_is_valid
             and max(row.high for row in opening) <= min(row.low for row in opening)
         ):
@@ -502,26 +770,43 @@ def validate_bars(
             "missing_candle_times": missing,
             "eligible": not reasons,
             "reason": "; ".join(reasons) if reasons else None,
+            "calendar_classification": calendar_type,
         })
     if not eligible_dates:
         details.append("No complete, valid 09:15–15:30 IST trading sessions were available.")
     weekday_dates_without_bars = []
+    missing_session_classifications = []
     candidate = config.start
     while candidate < config.end:
         if candidate.weekday() < 5 and candidate not in grouped:
             weekday_dates_without_bars.append(candidate.isoformat())
+            if candidate in session_calendar["holidays"]:
+                classification = "configured_exchange_holiday"
+            elif candidate in session_calendar["special_sessions"]:
+                classification = "configured_special_session_no_data"
+            elif candidate in session_calendar["regular_sessions"]:
+                classification = "configured_regular_session_provider_gap"
+            else:
+                classification = "unresolved_holiday_special_session_or_provider_gap"
+            missing_session_classifications.append({
+                "date": candidate.isoformat(),
+                "classification": classification,
+            })
         candidate += timedelta(days=1)
-    # A Yahoo-data date is not enough to distinguish an exchange holiday from a provider outage.
     calendar_note = (
-        "Sessions are identified from observed Yahoo timestamps and checked against the regular "
-        "NSE 09:15–15:30 schedule. The tested exchange_calendars 4.13.2 release does not register XNSE, "
-        "so no reliable NSE holiday calendar is available here. Weekdays with no returned bars are "
-        "listed as ambiguous (holiday versus provider gap); verify them and special sessions against "
-        "official NSE notices."
+        "Session calendar classifications use the optional user-supplied JSON file when configured. "
+        "Otherwise observed dates are checked against the regular 09:15–15:30 Asia/Kolkata schedule, "
+        "and weekdays without rows remain unresolved; they are not presumed holidays or provider failures. "
+        "Special sessions require explicit calendar entries and are excluded from this regular-session strategy."
     )
     has_global_error = bool(
         duplicate_count or off_session_count
         or outside_requested_range
+        or calendar_error
+        or any(
+            session_date in session_calendar["holidays"]
+            for session_date in grouped
+        )
         or any("strictly chronological" in item or "timezone-naive" in item for item in details)
     )
     validated_bars = [
@@ -549,6 +834,8 @@ def validate_bars(
             or "outside the requested date range" in item
             or "No complete, valid" in item
             or "Insufficient completed candles" in item
+            or "Configured session calendar" in item
+            or "Configured session calendar assigns" in item
         )
     ]
     quality = {
@@ -563,6 +850,15 @@ def validate_bars(
         "row_count": len(bars),
         "observed_session_count": len(grouped),
         "weekday_dates_without_bars": weekday_dates_without_bars,
+        "missing_session_classifications": missing_session_classifications,
+        "session_calendar": {
+            "path": str(config.session_calendar) if config.session_calendar else None,
+            "sha256": calendar_sha256,
+            "holidays": sorted(value.isoformat() for value in session_calendar["holidays"]),
+            "special_sessions": sorted(value.isoformat() for value in session_calendar["special_sessions"]),
+            "regular_sessions": sorted(value.isoformat() for value in session_calendar["regular_sessions"]),
+            "error": calendar_error,
+        },
         "eligible_session_count": len(eligible_dates),
         "eligible_sessions": eligible_dates,
         "rejected_sessions": excluded_dates,
@@ -607,6 +903,31 @@ def validate_bars(
         ],
         "retrieved_at_utc": (metadata or {}).get("retrieved_at_utc"),
         "retrieval_mode": (metadata or {}).get("retrieval_mode", "provided to validator"),
+        "manifest_schema_version": (metadata or {}).get("manifest_schema_version"),
+        "cache_schema_version": (metadata or {}).get("cache_schema_version"),
+        "cache_provenance": (metadata or {}).get("cache_provenance"),
+        "cache_integrity_status": (metadata or {}).get("cache_integrity_status", "not_verified"),
+        "cache_age_seconds": (metadata or {}).get("cache_age_seconds"),
+        "cache_age_days": (metadata or {}).get("cache_age_days"),
+        "cache_max_age_days": (
+            (metadata or {}).get("cache_max_age_days", config.max_cache_age_days)
+        ),
+        "cache_freshness_status": (
+            (metadata or {}).get("cache_freshness_status", "not_applicable")
+        ),
+        "stale_cache_override": (metadata or {}).get("stale_cache_override", False),
+        "cache_csv_sha256": (metadata or {}).get("csv_sha256"),
+        "cache_original_download_sha256": (
+            (metadata or {}).get("original_download_sha256")
+        ),
+        "cache_retrieval_id": (metadata or {}).get("retrieval_id"),
+        "validation_status": "passed" if passed else "failed",
+        "coverage_status": (
+            "complete_for_observed_sessions"
+            if passed and not missing_total
+            else "partial_or_failed"
+        ),
+        "backtest_run": False,
     }
     return ValidatedData(
         bars=validated_bars,
