@@ -317,3 +317,196 @@ async function refreshAccountInsights() {
   }
 }
 $("account-insights-refresh").addEventListener("click", refreshAccountInsights);
+
+let replaySessionId = null;
+let replayLastSequence = 0;
+let replayPollTimer = null;
+let replayRenderedTrades = [];
+const replayTerminalStates = new Set(["completed","stopped","failed"]);
+const replayRunningStates = new Set(["validating","running","stopping"]);
+
+function renderReplayTrades(trades) {
+  const body = $("replay-trades");
+  if(!trades.length) {
+    body.innerHTML = '<tr><td colspan="6" class="muted">No completed replay trades.</td></tr>';
+    return;
+  }
+  body.innerHTML = trades.map(t =>
+    `<tr><td>${escapeHtml(t.session_date)}</td><td>${escapeHtml(t.direction)}</td>` +
+    `<td>${Number(t.entry_price).toFixed(2)}</td><td>${Number(t.exit_price).toFixed(2)}</td>` +
+    `<td>${escapeHtml(t.exit_reason)}</td><td>${Number(t.gross_pnl_points).toFixed(2)}</td></tr>`
+  ).join("");
+}
+
+function renderReplayEvent(event) {
+  const list = $("replay-events");
+  if(list.children.length === 1 && list.children[0].classList.contains("muted")) list.innerHTML = "";
+  const detail = event.signal || event.trade || {};
+  const description = event.type === "signal" ?
+    `${detail.direction} signal · ${detail.accepted ? "entry eligible" : detail.reason}` :
+    event.type === "entry" ? `${detail.direction} simulated index entry at ${Number(detail.entry_price).toFixed(2)}` :
+    event.type === "exit" ? `${detail.direction} simulated exit · ${detail.exit_reason} · ${Number(detail.gross_pnl_points).toFixed(2)} points` :
+    event.type;
+  const item = document.createElement("li");
+  item.textContent = `${kolkataTime(event.timestamp)} · ${description}`;
+  list.appendChild(item);
+  while(list.children.length > 100) list.removeChild(list.firstElementChild);
+  if(event.type === "exit") {
+    replayRenderedTrades.push(event.trade);
+    renderReplayTrades(replayRenderedTrades);
+  }
+}
+
+function renderReplayStatus(status) {
+  $("replay-status").textContent = status.status;
+  $("replay-status").dataset.state = status.status;
+  $("replay-progress").value = Number(status.progress_percent || 0);
+  $("replay-progress-percent").textContent = `${Number(status.progress_percent || 0).toFixed(1)}%`;
+  $("replay-progress-text").textContent = status.total_bars ?
+    `${Number(status.processed_bars).toLocaleString("en-IN")} / ${Number(status.total_bars).toLocaleString("en-IN")} validated candles` :
+    status.status === "validating" ? "Validating and acquiring historical candles…" : "No candles processed";
+  if(status.current_timestamp) {
+    $("replay-progress-text").textContent += ` · ${kolkataTime(status.current_timestamp)}`;
+  }
+  const position = status.open_position;
+  $("replay-position").textContent = position ?
+    `${position.direction} · ${Number(position.entry_price).toFixed(2)} → ${Number(position.mark_price).toFixed(2)}` :
+    "None";
+  $("replay-position-pnl").textContent = position ?
+    `Unrealized ${Number(position.unrealized_points).toFixed(2)} underlying points · stop ${Number(position.stop_price).toFixed(2)} · target ${Number(position.target_price).toFixed(2)}` :
+    "No open simulated index position";
+  $("replay-position-pnl").className = position ?
+    (Number(position.unrealized_points) >= 0 ? "positive" : "negative") : "muted";
+  $("replay-start").disabled = replayRunningStates.has(status.status);
+  $("replay-stop").disabled = !["validating","running"].includes(status.status);
+  if(status.error) {
+    $("replay-message").textContent = status.error;
+    $("replay-message").className = "negative";
+  } else if(status.status === "stopping") {
+    $("replay-message").textContent = "Stop requested; no later candle will be processed.";
+    $("replay-message").className = "muted";
+  } else if(status.status === "completed") {
+    $("replay-message").textContent = "Replay complete. Results are underlying-index points, not options P&L.";
+    $("replay-message").className = "positive";
+  } else if(status.status === "stopped") {
+    $("replay-message").textContent = "Replay stopped. Partial results are not presented as a completed backtest.";
+    $("replay-message").className = "muted";
+  } else if(status.data_quality && status.data_quality.passed) {
+    const quality = status.data_quality;
+    const source = quality.retrieval_mode || "validated historical data";
+    $("replay-message").textContent =
+      `Data quality passed · ${Number(quality.row_count || 0).toLocaleString("en-IN")} candles · ${source}. Yahoo candle timestamp labeling remains an unverified assumption.`;
+    $("replay-message").className = "muted";
+  }
+}
+
+function renderReplayMetrics(metrics) {
+  if(!metrics) return;
+  $("replay-trade-count").textContent = metrics.completed_trades;
+  $("replay-event-count").textContent = metrics.raw_breakout_events;
+  $("replay-points").textContent = Number(metrics.gross_underlying_points).toFixed(2);
+  $("replay-points").className = Number(metrics.gross_underlying_points) >= 0 ? "positive" : "negative";
+  $("replay-session-count").textContent = metrics.eligible_sessions;
+}
+
+async function pollReplay(sessionId) {
+  if(replaySessionId !== sessionId) return;
+  try {
+    const status = await api(`/api/replay/${encodeURIComponent(sessionId)}`);
+    if(replaySessionId !== sessionId) return;
+    renderReplayStatus(status);
+    const batch = await api(`/api/replay/${encodeURIComponent(sessionId)}/events?after=${replayLastSequence}`);
+    if(replaySessionId !== sessionId) return;
+    for(const event of batch.events) {
+      replayLastSequence = Math.max(replayLastSequence, Number(event.event_seq));
+      renderReplayEvent(event);
+    }
+    if(status.status === "completed") {
+      const results = await api(`/api/replay/${encodeURIComponent(sessionId)}/results`);
+      if(replaySessionId !== sessionId) return;
+      renderReplayMetrics(results.metrics);
+      replayRenderedTrades = results.trades || [];
+      renderReplayTrades(replayRenderedTrades);
+    }
+    if(replayTerminalStates.has(status.status)) {
+      clearTimeout(replayPollTimer);
+      replayPollTimer = null;
+      return;
+    }
+    replayPollTimer = setTimeout(() => pollReplay(sessionId), 500);
+  } catch(err) {
+    if(replaySessionId !== sessionId) return;
+    $("replay-message").textContent = `Replay status unavailable: ${err.message}`;
+    $("replay-message").className = "negative";
+    replayPollTimer = setTimeout(() => pollReplay(sessionId), 1500);
+  }
+}
+
+function attachReplay(sessionId) {
+  replaySessionId = sessionId;
+  replayLastSequence = 0;
+  replayRenderedTrades = [];
+  $("replay-events").innerHTML = "";
+  renderReplayTrades([]);
+  $("replay-trade-count").textContent = "—";
+  $("replay-event-count").textContent = "—";
+  $("replay-points").textContent = "—";
+  $("replay-session-count").textContent = "—";
+  clearTimeout(replayPollTimer);
+  pollReplay(sessionId);
+}
+
+$("replay-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const values = new FormData(form);
+  const ratio = String(values.get("opening_range_atr_max_ratio") || "").trim();
+  const payload = {
+    start: values.get("start"),
+    end: values.get("end"),
+    offline: form.elements.offline.checked,
+    allow_stale_cache: form.elements.allow_stale_cache.checked,
+    ema50_filter: form.elements.ema50_filter.checked,
+    opening_range_atr_max_ratio: ratio ? Number(ratio) : null,
+  };
+  $("replay-start").disabled = true;
+  $("replay-message").textContent = "Starting replay; historical data must pass validation first…";
+  $("replay-message").className = "muted";
+  try {
+    const session = await api("/api/replay/start", {method:"POST", body:JSON.stringify(payload)});
+    attachReplay(session.session_id);
+  } catch(err) {
+    $("replay-start").disabled = false;
+    $("replay-status").textContent = "Failed to start";
+    $("replay-message").textContent = err.message;
+    $("replay-message").className = "negative";
+  }
+});
+$("replay-form").elements.offline.addEventListener("change", event => {
+  $("replay-form").elements.allow_stale_cache.disabled = !event.currentTarget.checked;
+  if(!event.currentTarget.checked) $("replay-form").elements.allow_stale_cache.checked = false;
+});
+$("replay-stop").addEventListener("click", async () => {
+  if(!replaySessionId) return;
+  $("replay-stop").disabled = true;
+  try {
+    const status = await api(`/api/replay/${encodeURIComponent(replaySessionId)}/stop`, {method:"POST"});
+    renderReplayStatus(status);
+  } catch(err) {
+    $("replay-message").textContent = err.message;
+    $("replay-message").className = "negative";
+  }
+});
+
+async function restoreReplaySession() {
+  try {
+    const sessions = await api("/api/replay");
+    const session = [...sessions].reverse().find(item => replayRunningStates.has(item.status)) ||
+      [...sessions].reverse().find(item => replayTerminalStates.has(item.status));
+    if(session) attachReplay(session.session_id);
+  } catch(err) {
+    $("replay-message").textContent = `Existing replay status unavailable: ${err.message}`;
+    $("replay-message").className = "negative";
+  }
+}
+restoreReplaySession();

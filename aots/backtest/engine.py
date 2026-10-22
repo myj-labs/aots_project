@@ -169,232 +169,381 @@ def run_backtest(data: ValidatedData, config: BacktestConfig) -> BacktestResult:
         raise ValueError("Backtest requires data that passed the validation gate.")
     if not data.bars:
         raise ValueError("Backtest requires validated OHLC bars.")
-    if not all(bar.timestamp.tzinfo is not None for bar in data.bars):
-        raise ValueError("Backtest timestamps must be timezone-aware.")
+    runner = BacktestRunner(data.quality, config)
+    for bar in data.bars:
+        runner.process_bar(bar)
+    return runner.finish()
 
-    # The ^NSEI index is not a traded instrument; its volume is not treated as executed quantity.
-    if config.vwap_filter or config.breakout_volume_filter:
-        raise UnsupportedFilterError(
-            "VWAP and breakout-volume filters are unavailable for ^NSEI because index volume "
-            "has not been validated as meaningful traded-instrument volume."
-        )
 
-    bars = list(data.bars)
-    session_indices: dict[date, list[int]] = defaultdict(list)
-    for index, bar in enumerate(bars):
-        session_indices[bar.timestamp.astimezone(KOLKATA).date()].append(index)
-    ema = _ema_values(bars)
-    atr = _atr_values(bars)
-    signals: list[Signal] = []
-    trades: list[Trade] = []
-    rejected_sessions: list[dict[str, str]] = []
+class BacktestRunner:
+    """Shared chronological ORB executor used by batch backtests and historical replay."""
 
-    for session_date, indices in sorted(session_indices.items()):
-        session_bars = [bars[index] for index in indices]
-        opening_bars = [bar for bar in session_bars if OPENING_RANGE_START <= _time_at(bar) < OPENING_RANGE_END]
-        if len(opening_bars) != 6:
-            rejected_sessions.append({
-                "date": session_date.isoformat(),
-                "reason": "Opening range requires six complete 5-minute candles.",
+    def __init__(self, quality: dict[str, Any], config: BacktestConfig):
+        if not quality.get("passed"):
+            raise ValueError("Backtest requires data that passed the validation gate.")
+        if config.vwap_filter or config.breakout_volume_filter:
+            raise UnsupportedFilterError(
+                "VWAP and breakout-volume filters are unavailable for ^NSEI because index volume "
+                "has not been validated as meaningful traded-instrument volume."
+            )
+        self.config = config
+        self.quality = quality
+        self.signals: list[Signal] = []
+        self.trades: list[Trade] = []
+        self.rejected_sessions: list[dict[str, str]] = []
+        self._session: dict[str, Any] | None = None
+        self._session_dates: set[date] = set()
+        self._last_timestamp: datetime | None = None
+        self._last_bar: Bar | None = None
+        self._finished = False
+        self._ema_seed: list[float] = []
+        self._ema: float | None = None
+        self._true_ranges: list[float] = []
+        self._previous_close: float | None = None
+        self._pending_events: list[dict[str, Any]] = []
+
+    def process_bar(self, bar: Bar) -> list[dict[str, Any]]:
+        if self._finished:
+            raise RuntimeError("Cannot process bars after the backtest runner has finished.")
+        if bar.timestamp.tzinfo is None or bar.timestamp.utcoffset() is None:
+            raise ValueError("Backtest timestamps must be timezone-aware.")
+        if self._last_timestamp is not None and bar.timestamp <= self._last_timestamp:
+            raise ValueError("Backtest bars must be strictly chronological.")
+        self._last_timestamp = bar.timestamp
+        self._last_bar = bar
+        session_date = bar.timestamp.astimezone(KOLKATA).date()
+        self._session_dates.add(session_date)
+        if self._session is None or self._session["date"] != session_date:
+            self._finish_session()
+            self._session = self._new_session(session_date)
+
+        ema_value, atr_value = self._update_indicators(bar)
+        session = self._session
+        bar_time = _time_at(bar)
+        if bar_time < OPENING_RANGE_END:
+            if OPENING_RANGE_START <= bar_time:
+                session["opening_bars"].append(bar)
+            return self._drain_events()
+
+        if not session["opening_ready"]:
+            opening_bars = session["opening_bars"]
+            if len(opening_bars) != 6:
+                session["invalid_reason"] = "Opening range requires six complete 5-minute candles."
+                return self._drain_events()
+            opening_high = max(item.high for item in opening_bars)
+            opening_low = min(item.low for item in opening_bars)
+            opening_width = opening_high - opening_low
+            if not isfinite(opening_width) or opening_width <= 0:
+                session["invalid_reason"] = "Opening-range width is zero or invalid."
+                return self._drain_events()
+            session.update({
+                "opening_high": opening_high,
+                "opening_low": opening_low,
+                "opening_width": opening_width,
+                "opening_ready": True,
             })
-            continue
-        opening_high = max(bar.high for bar in opening_bars)
-        opening_low = min(bar.low for bar in opening_bars)
-        opening_width = opening_high - opening_low
-        if not isfinite(opening_width) or opening_width <= 0:
-            rejected_sessions.append({
-                "date": session_date.isoformat(),
-                "reason": "Opening-range width is zero or invalid.",
-            })
-            continue
 
-        breakout_events = dict(_breakout_events(
-            session_bars,
-            opening_high,
-            opening_low,
-        ))
-        session_trade_count = 0
-        active_position: dict[str, Any] | None = None
-        session_trades: list[Trade] = []
-        for local_index, global_index in enumerate(indices):
-            bar = bars[global_index]
-            bar_time = _time_at(bar)
-            position_exited_on_bar = False
-            if bar_time < OPENING_RANGE_END:
-                continue
-
-            if active_position is not None:
-                if bar_time >= config.time_exit:
-                    _finish_trade(
-                        active_position,
-                        bar,
-                        bar.open,
-                        "TIME_EXIT",
-                        "time exit at 15:15 candle open",
-                        session_trades,
-                    )
-                    active_position = None
-                    session_trade_count += 1
+        self._resolve_pending(bar)
+        position_exited_on_bar = False
+        active_position = session["active_position"]
+        if active_position is not None:
+            if bar_time >= self.config.time_exit:
+                self._close_position(
+                    active_position,
+                    bar,
+                    bar.open,
+                    "TIME_EXIT",
+                    "time exit at 15:15 candle open",
+                )
+                position_exited_on_bar = True
+            else:
+                exit_values = _check_exit(active_position, bar)
+                if exit_values is not None:
+                    price, reason, adjustment = exit_values
+                    self._close_position(active_position, bar, price, reason, adjustment)
                     position_exited_on_bar = True
                 else:
-                    exit_values = _check_exit(active_position, bar)
-                    if exit_values is not None:
-                        price, reason, adjustment = exit_values
-                        _finish_trade(
-                            active_position, bar, price, reason, adjustment, session_trades
-                        )
-                        active_position = None
-                        session_trade_count += 1
-                        position_exited_on_bar = True
-                    else:
-                        _update_excursions(active_position, bar)
+                    _update_excursions(active_position, bar)
 
-            direction = breakout_events.get(local_index)
-            if direction is None:
-                continue
-            next_local_index = local_index + 1
-            next_bar = session_bars[next_local_index] if next_local_index < len(session_bars) else None
-            decision_time = bar.timestamp.astimezone(KOLKATA) + timedelta(minutes=5)
+        direction = (
+            "LONG" if bar.close > session["opening_high"]
+            else "SHORT" if bar.close < session["opening_low"]
+            else None
+        )
+        is_event = direction is not None and direction != session["previous_direction"]
+        session["previous_direction"] = direction
+        if is_event:
             active_filters, filter_reasons = _signal_filter_reasons(
                 direction,
                 bar.close,
-                opening_width,
-                global_index,
-                ema,
-                atr,
-                config,
+                session["opening_width"],
+                0,
+                [ema_value],
+                [atr_value],
+                self.config,
             )
             rejection_reasons = list(filter_reasons)
             if position_exited_on_bar:
                 rejection_reasons.append(
                     "position exited on this candle; entry deferred because intrabar ordering is unknown"
                 )
-            if active_position is not None:
+            if session["active_position"] is not None:
                 rejection_reasons.append("another position is already open")
-            if session_trade_count >= config.max_trades_per_session:
+            if session["trade_count"] >= self.config.max_trades_per_session:
                 rejection_reasons.append("maximum completed trades per session reached")
-            if next_bar is None:
-                rejection_reasons.append("no next candle is available for entry")
-            elif _time_at(next_bar) > config.entry_cutoff:
-                rejection_reasons.append("next candle opens after the entry cutoff")
-            elif _time_at(next_bar) >= config.time_exit:
-                rejection_reasons.append("next candle opens at or after the time exit")
+            session["pending"] = {
+                "bar": bar,
+                "direction": direction,
+                "active_filters": active_filters or ["baseline breakout; no optional filters"],
+                "filter_reasons": filter_reasons,
+                "rejection_reasons": rejection_reasons,
+            }
+        return self._drain_events()
 
-            entry_price = next_bar.open if next_bar is not None else None
-            stop_price = opening_low if direction == "LONG" else opening_high
-            if entry_price is not None and (
-                (direction == "LONG" and entry_price <= stop_price)
-                or (direction == "SHORT" and entry_price >= stop_price)
-            ):
-                rejection_reasons.append("next-candle gap makes the opening-range stop unusable")
-            signal = Signal(
-                session_date=session_date.isoformat(),
-                timestamp=_timestamp(bar),
-                decision_timestamp=decision_time.isoformat(),
-                direction=direction,
-                opening_range_high=opening_high,
-                opening_range_low=opening_low,
-                opening_range_width=opening_width,
-                close_price=bar.close,
-                active_filters=active_filters or ["baseline breakout; no optional filters"],
-                accepted=not rejection_reasons,
-                reason="accepted" if not rejection_reasons else "; ".join(rejection_reasons),
-                entry_timestamp=_timestamp(next_bar) if next_bar is not None else None,
-                entry_price=entry_price,
-                filters_passed=not filter_reasons,
-            )
-            signals.append(signal)
-            if not signal.accepted or next_bar is None:
-                continue
+    def finish(self) -> BacktestResult:
+        if not self._finished:
+            self._finish_session()
+            self._finished = True
+        all_rejections = list(self.quality.get("rejected_sessions", [])) + self.rejected_sessions
+        rejected_dates = {item["date"] for item in all_rejections}
+        eligible_dates = [
+            session_date.isoformat()
+            for session_date in sorted(self._session_dates)
+            if session_date.isoformat() not in rejected_dates
+        ]
+        metrics = calculate_metrics(
+            self.trades,
+            len(eligible_dates),
+            all_rejections,
+            eligible_dates,
+        )
+        metrics["eligible_sessions"] = max(
+            0,
+            int(self.quality.get("observed_session_count", len(self._session_dates)))
+            - len(all_rejections),
+        )
+        metrics["sessions_rejected_for_data_quality"] = len(all_rejections)
+        metrics["rejected_session_details"] = all_rejections
+        metrics["raw_breakout_events"] = len(self.signals)
+        metrics["total_breakout_signals"] = len(self.signals)
+        metrics["signals_rejected"] = sum(not signal.accepted for signal in self.signals)
+        metrics["signals_accepted"] = sum(signal.accepted for signal in self.signals)
+        metrics["filter_passing_events"] = sum(signal.filters_passed for signal in self.signals)
+        metrics["filter_rejected_events"] = sum(not signal.filters_passed for signal in self.signals)
+        metrics["entry_attempts"] = sum(signal.entry_attempted for signal in self.signals)
+        metrics["entry_rejected_events"] = sum(
+            signal.filters_passed and not signal.entry_attempted for signal in self.signals
+        )
+        reason_counts: dict[str, int] = defaultdict(int)
+        for signal in self.signals:
+            for reason in signal.reason.split("; "):
+                if reason != "accepted":
+                    reason_counts[reason] += 1
+        metrics["rejection_reason_counts"] = dict(sorted(reason_counts.items()))
+        metrics["market_condition_breakdown"] = {
+            "status": "not classified",
+            "reason": "No pre-registered, defensible market-regime labels are included in this dataset.",
+        }
+        metrics["research_validation"] = _research_validation(
+            self.trades, metrics["eligible_sessions"]
+        )
+        return BacktestResult(
+            signals=list(self.signals),
+            trades=list(self.trades),
+            metrics=metrics,
+            eligible_sessions=metrics["eligible_sessions"],
+            rejected_sessions=all_rejections,
+        )
+
+    def drain_events(self) -> list[dict[str, Any]]:
+        return self._drain_events()
+
+    @property
+    def open_position(self) -> dict[str, Any] | None:
+        if self._session is None or self._last_bar is None:
+            return None
+        position = self._session["active_position"]
+        if position is None:
+            return None
+        sign = 1 if position["direction"] == "LONG" else -1
+        mark = self._last_bar.close
+        return {
+            "session_date": position["session_date"],
+            "direction": position["direction"],
+            "entry_timestamp": position["entry_timestamp"],
+            "entry_price": position["entry_price"],
+            "mark_price": mark,
+            "stop_price": position["stop_price"],
+            "target_price": position["target_price"],
+            "unrealized_points": (mark - position["entry_price"]) * sign,
+        }
+
+    def _new_session(self, session_date: date) -> dict[str, Any]:
+        return {
+            "date": session_date,
+            "opening_bars": [],
+            "opening_ready": False,
+            "opening_high": None,
+            "opening_low": None,
+            "opening_width": None,
+            "previous_direction": None,
+            "pending": None,
+            "active_position": None,
+            "trade_count": 0,
+            "signals": [],
+            "trades": [],
+            "invalid_reason": None,
+        }
+
+    def _update_indicators(self, bar: Bar) -> tuple[float | None, float | None]:
+        if self._ema is None:
+            self._ema_seed.append(bar.close)
+            if len(self._ema_seed) == 50:
+                self._ema = sum(self._ema_seed) / 50
+        else:
+            alpha = 2 / 51
+            self._ema = alpha * bar.close + (1 - alpha) * self._ema
+        true_range = _true_range(bar, self._previous_close)
+        self._true_ranges.append(true_range)
+        self._previous_close = bar.close
+        atr_value = (
+            sum(self._true_ranges[-14:]) / 14
+            if len(self._true_ranges) >= 14 else None
+        )
+        return self._ema, atr_value
+
+    def _resolve_pending(self, next_bar: Bar | None) -> None:
+        session = self._session
+        pending = session["pending"]
+        if pending is None:
+            return
+        session["pending"] = None
+        signal_bar = pending["bar"]
+        direction = pending["direction"]
+        reasons = list(pending["rejection_reasons"])
+        if next_bar is None:
+            reasons.append("no next candle is available for entry")
+        else:
+            next_time = _time_at(next_bar)
+            if next_time > self.config.entry_cutoff:
+                reasons.append("next candle opens after the entry cutoff")
+            elif next_time >= self.config.time_exit:
+                reasons.append("next candle opens at or after the time exit")
+        entry_price = next_bar.open if next_bar is not None else None
+        stop_price = session["opening_low"] if direction == "LONG" else session["opening_high"]
+        if entry_price is not None and (
+            (direction == "LONG" and entry_price <= stop_price)
+            or (direction == "SHORT" and entry_price >= stop_price)
+        ):
+            reasons.append("next-candle gap makes the opening-range stop unusable")
+        signal = Signal(
+            session_date=session["date"].isoformat(),
+            timestamp=_timestamp(signal_bar),
+            decision_timestamp=(
+                signal_bar.timestamp.astimezone(KOLKATA) + timedelta(minutes=5)
+            ).isoformat(),
+            direction=direction,
+            opening_range_high=session["opening_high"],
+            opening_range_low=session["opening_low"],
+            opening_range_width=session["opening_width"],
+            close_price=signal_bar.close,
+            active_filters=pending["active_filters"],
+            accepted=not reasons,
+            reason="accepted" if not reasons else "; ".join(reasons),
+            entry_timestamp=_timestamp(next_bar) if next_bar is not None else None,
+            entry_price=entry_price,
+            filters_passed=not pending["filter_reasons"],
+        )
+        session["signals"].append(signal)
+        opened_position = None
+        if signal.accepted and entry_price is not None:
             risk_points = abs(entry_price - stop_price)
             if not isfinite(risk_points) or risk_points <= 0:
                 signal.accepted = False
                 signal.reason = "entry-to-stop risk is zero or invalid"
-                continue
-            target_price = (
-                entry_price + 2 * risk_points if direction == "LONG"
-                else entry_price - 2 * risk_points
-            )
-            if target_price <= 0 or not isfinite(target_price):
-                signal.accepted = False
-                signal.reason = "2R target is zero or invalid at the next-candle entry price"
-                continue
-            signal.entry_attempted = True
-            active_position = {
-                "signal": signal,
-                "session_date": session_date.isoformat(),
-                "entry_timestamp": _timestamp(next_bar),
-                "direction": direction,
-                "opening_range_high": opening_high,
-                "opening_range_low": opening_low,
-                "opening_range_width": opening_width,
-                "entry_price": entry_price,
-                "stop_price": stop_price,
-                "target_price": target_price,
-                "risk_points": risk_points,
-                "mfe": 0.0,
-                "mae": 0.0,
-                "execution_adjustment": "entry at next 5-minute candle open",
-            }
-        if active_position is not None:
-            rejected_sessions.append({
-                "date": session_date.isoformat(),
+            else:
+                target_price = (
+                    entry_price + 2 * risk_points if direction == "LONG"
+                    else entry_price - 2 * risk_points
+                )
+                if target_price <= 0 or not isfinite(target_price):
+                    signal.accepted = False
+                    signal.reason = "2R target is zero or invalid at the next-candle entry price"
+                else:
+                    signal.entry_attempted = True
+                    position = {
+                        "signal": signal,
+                        "session_date": session["date"].isoformat(),
+                        "entry_timestamp": _timestamp(next_bar),
+                        "direction": direction,
+                        "opening_range_high": session["opening_high"],
+                        "opening_range_low": session["opening_low"],
+                        "opening_range_width": session["opening_width"],
+                        "entry_price": entry_price,
+                        "stop_price": stop_price,
+                        "target_price": target_price,
+                        "risk_points": risk_points,
+                        "mfe": 0.0,
+                        "mae": 0.0,
+                        "execution_adjustment": "entry at next 5-minute candle open",
+                    }
+                    session["active_position"] = position
+                    opened_position = position
+        self._pending_events.append({
+            "type": "signal",
+            "timestamp": signal.timestamp,
+            "signal": asdict(signal),
+        })
+        if opened_position is not None:
+            self._pending_events.append({
+                "type": "entry",
+                "timestamp": _timestamp(next_bar),
+                "signal": asdict(signal),
+            })
+
+    def _close_position(
+        self,
+        position: dict[str, Any],
+        bar: Bar,
+        price: float,
+        reason: str,
+        adjustment: str,
+    ) -> None:
+        session = self._session
+        _finish_trade(position, bar, price, reason, adjustment, session["trades"])
+        trade = session["trades"][-1]
+        session["active_position"] = None
+        session["trade_count"] += 1
+        self._pending_events.append({
+            "type": "exit",
+            "timestamp": trade.exit_timestamp,
+            "trade": asdict(trade),
+        })
+
+    def _finish_session(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        if session["pending"] is not None:
+            self._resolve_pending(None)
+        if session["invalid_reason"] is not None:
+            self.rejected_sessions.append({
+                "date": session["date"].isoformat(),
+                "reason": session["invalid_reason"],
+            })
+        elif session["active_position"] is not None:
+            self.rejected_sessions.append({
+                "date": session["date"].isoformat(),
                 "reason": "Open position had no valid 15:15 time-exit candle; session excluded.",
             })
-            signals = [signal for signal in signals if signal.session_date != session_date.isoformat()]
-            trades = [trade for trade in trades if trade.session_date != session_date.isoformat()]
-            continue
-        trades.extend(session_trades)
+        else:
+            self.signals.extend(session["signals"])
+            self.trades.extend(session["trades"])
+        self._session = None
 
-    validation_rejections = list(data.quality.get("rejected_sessions", []))
-    all_rejections = validation_rejections + rejected_sessions
-    rejected_dates = {item["date"] for item in all_rejections}
-    eligible_session_dates = [
-        session_date.isoformat()
-        for session_date in sorted(session_indices)
-        if session_date.isoformat() not in rejected_dates
-    ]
-    metrics = calculate_metrics(
-        trades,
-        len(eligible_session_dates),
-        all_rejections,
-        eligible_session_dates,
-    )
-    metrics["eligible_sessions"] = max(
-        0,
-        int(data.quality.get("observed_session_count", len(session_indices)))
-        - len(all_rejections),
-    )
-    metrics["sessions_rejected_for_data_quality"] = len(all_rejections)
-    metrics["rejected_session_details"] = all_rejections
-    metrics["raw_breakout_events"] = len(signals)
-    metrics["total_breakout_signals"] = len(signals)
-    metrics["signals_rejected"] = sum(not signal.accepted for signal in signals)
-    metrics["signals_accepted"] = sum(signal.accepted for signal in signals)
-    metrics["filter_passing_events"] = sum(signal.filters_passed for signal in signals)
-    metrics["filter_rejected_events"] = sum(not signal.filters_passed for signal in signals)
-    metrics["entry_attempts"] = sum(signal.entry_attempted for signal in signals)
-    metrics["entry_rejected_events"] = sum(
-        signal.filters_passed and not signal.entry_attempted for signal in signals
-    )
-    reason_counts: dict[str, int] = defaultdict(int)
-    for signal in signals:
-        for reason in signal.reason.split("; "):
-            if reason != "accepted":
-                reason_counts[reason] += 1
-    metrics["rejection_reason_counts"] = dict(sorted(reason_counts.items()))
-    metrics["market_condition_breakdown"] = {
-        "status": "not classified",
-        "reason": "No pre-registered, defensible market-regime labels are included in this dataset.",
-    }
-    metrics["research_validation"] = _research_validation(trades, metrics["eligible_sessions"])
-    return BacktestResult(
-        signals=signals,
-        trades=trades,
-        metrics=metrics,
-        eligible_sessions=metrics["eligible_sessions"],
-        rejected_sessions=all_rejections,
-    )
+    def _drain_events(self) -> list[dict[str, Any]]:
+        events, self._pending_events = self._pending_events, []
+        return events
 
 
 def _check_exit(position: dict[str, Any], bar: Bar) -> tuple[float, str, str] | None:

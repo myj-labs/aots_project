@@ -1,7 +1,7 @@
 ﻿from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -12,6 +12,7 @@ from .models import (
     PaperTradeRequest,
     MarkPriceRequest,
     KillSwitchRequest,
+    HistoricalReplayRequest,
     StrategyEvaluationRequest,
 )
 from .paper import PaperBroker
@@ -22,6 +23,12 @@ from .provider_session import (
 )
 from .risk import RiskEngine, RiskRejected
 from .strategy_service import StrategyService
+from .backtest.data import BacktestConfig
+from .backtest.replay import (
+    ReplayCapacityError,
+    ReplayNotFound,
+    ReplayService,
+)
 
 settings = get_settings()
 db = Database(settings.database_path)
@@ -31,12 +38,16 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 
 provider_session = ProviderSessionManager()
+replay_service = ReplayService()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global replay_service
+    replay_service = ReplayService()
     db.event("APP_STARTED", {"mode": settings.trading_mode, "broker": settings.broker})
     yield
+    replay_service.shutdown()
     provider_session.shutdown()
     db.event("APP_STOPPED", {})
 
@@ -159,6 +170,64 @@ def positions():
 @app.get("/api/events")
 def events():
     return db.events(100)
+
+
+@app.post("/api/replay/start")
+def start_historical_replay(req: HistoricalReplayRequest):
+    try:
+        config = BacktestConfig(
+            start=req.start,
+            end=req.end,
+            data_dir=Path("data/backtest"),
+            ema50_filter=req.ema50_filter,
+            opening_range_atr_max_ratio=req.opening_range_atr_max_ratio,
+        )
+        return replay_service.start(
+            config,
+            offline=req.offline,
+            allow_stale_cache=req.allow_stale_cache,
+        )
+    except ReplayCapacityError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/replay")
+def historical_replay_sessions():
+    return replay_service.list_sessions()
+
+
+@app.get("/api/replay/{session_id}")
+def historical_replay_status(session_id: str):
+    try:
+        return replay_service.status(session_id)
+    except ReplayNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/replay/{session_id}/events")
+def historical_replay_events(session_id: str, after: int = Query(default=0, ge=0)):
+    try:
+        return replay_service.events(session_id, after=after)
+    except ReplayNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/replay/{session_id}/results")
+def historical_replay_results(session_id: str):
+    try:
+        return replay_service.results(session_id)
+    except ReplayNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/replay/{session_id}/stop")
+def stop_historical_replay(session_id: str):
+    try:
+        return replay_service.stop(session_id)
+    except ReplayNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 def _strategy_service():

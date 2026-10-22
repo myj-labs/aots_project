@@ -1,6 +1,6 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def utc_now() -> datetime:
@@ -87,6 +87,27 @@ class StrategyEvaluationRequest(BaseModel):
         if entry is not None and value >= entry:
             raise ValueError("For long-option candidates, stop_price must be below entry_price.")
         return value
+
+
+class HistoricalReplayRequest(BaseModel):
+    start: date
+    end: date
+    offline: bool = False
+    allow_stale_cache: bool = False
+    ema50_filter: bool = False
+    opening_range_atr_max_ratio: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False
+    )
+
+    @model_validator(mode="after")
+    def validate_replay_window(self):
+        if self.end <= self.start:
+            raise ValueError("end must be later than start; end is exclusive.")
+        if (self.end - self.start).days > 60:
+            raise ValueError("Historical replay is limited to a 60-calendar-day request window.")
+        if self.allow_stale_cache and not self.offline:
+            raise ValueError("allow_stale_cache requires offline mode.")
+        return self
 
 
 class PaperTrade(BaseModel):

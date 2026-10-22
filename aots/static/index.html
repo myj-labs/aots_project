@@ -22,6 +22,47 @@
   <section class="warning">
     <strong>Paper trading only.</strong> Simulated orders never reach Groww. Marks are entered manually; there is no live market-data feed or source observation timestamp, so mark freshness is unavailable. The local kill switch blocks new paper entries; it does not cancel broker orders or square off a real account.
   </section>
+  <section class="panel replay-panel" id="historical-replay">
+    <div class="panel-heading">
+      <div>
+        <h2>Historical NIFTY ORB replay</h2>
+        <p class="muted">Research-only underlying-index simulation. This replay does not place broker orders or use Groww balance, paper capital, or paper-trade records.</p>
+      </div>
+      <span id="replay-status" class="pill">Idle</span>
+    </div>
+    <form id="replay-form">
+      <div class="form-row">
+        <label>Start date<input type="date" name="start" required></label>
+        <label>End date (exclusive)<input type="date" name="end" required></label>
+      </div>
+      <div class="form-row replay-options">
+        <label class="check-label"><input type="checkbox" name="offline"> Use validated local cache only</label>
+        <label class="check-label"><input type="checkbox" name="allow_stale_cache" disabled> Allow stale cache (offline only)</label>
+        <label class="check-label"><input type="checkbox" name="ema50_filter"> EMA(50) filter</label>
+        <label>Max opening-range / ATR(14) ratio<input type="number" name="opening_range_atr_max_ratio" min="0.01" step="0.01" placeholder="Optional"></label>
+      </div>
+      <div class="replay-actions">
+        <button type="submit" id="replay-start">Start validated replay</button>
+        <button type="button" id="replay-stop" class="danger" disabled>Stop replay</button>
+        <span id="replay-message" role="status" class="muted"></span>
+      </div>
+    </form>
+    <div class="replay-progress">
+      <div class="replay-progress-label"><span id="replay-progress-text">No replay active</span><strong id="replay-progress-percent">0%</strong></div>
+      <progress id="replay-progress" max="100" value="0"></progress>
+    </div>
+    <div class="cards replay-metrics">
+      <article class="metric"><span>Completed trades</span><strong id="replay-trade-count">—</strong></article>
+      <article class="metric"><span>Raw breakout events</span><strong id="replay-event-count">—</strong></article>
+      <article class="metric"><span>Gross underlying points</span><strong id="replay-points">—</strong><small>Not options P&amp;L or rupees</small></article>
+      <article class="metric"><span>Eligible sessions</span><strong id="replay-session-count">—</strong></article>
+      <article class="metric"><span>Open replay position</span><strong id="replay-position">None</strong><small id="replay-position-pnl">No open simulated index position</small></article>
+    </div>
+    <h3>Replay events</h3>
+    <ol id="replay-events" class="replay-event-list"><li class="muted">Events appear as the historical candles are processed.</li></ol>
+    <h3>Completed replay trades</h3>
+    <div class="table-wrap"><table><thead><tr><th>Session</th><th>Direction</th><th>Entry (index points)</th><th>Exit (index points)</th><th>Exit reason</th><th>Gross points</th></tr></thead><tbody id="replay-trades"><tr><td colspan="6" class="muted">No completed replay trades.</td></tr></tbody></table></div>
+  </section>
   <section class="cards">
     <article class="metric"><span>Illustrative capital</span><strong id="capital">₹100,000</strong><small>Configured starting capital</small></article>
     <article class="metric"><span>Daily P&amp;L (realised + open)</span><strong id="pnl">₹0.00</strong><small>Current Asia/Kolkata date</small></article>
