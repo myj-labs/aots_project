@@ -31,6 +31,11 @@ class ProviderAuthError(ProviderError):
     status_code = 401
 
 
+class ProviderPermissionError(ProviderError):
+    safe_message = "Provider denied access to this resource; verify account permissions."
+    status_code = 403
+
+
 class ProviderRejectedError(ProviderError):
     safe_message = "Provider rejected the request."
     status_code = 400

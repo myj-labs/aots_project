@@ -65,6 +65,17 @@ class ProviderConnection(MarketDataProvider, AccountInsightsProvider, Protocol):
     def close(self) -> None:
         """Stop provider resources and discard credential/token references."""
 
+    def get_historical_expiries(self, year: int, month: int) -> list[str]:
+        """Return documented historical derivative expiries."""
+
+    def get_historical_contracts(self, expiry_date: str) -> list[str]:
+        """Return documented historical derivative contract symbols."""
+
+    def check_historical_candles(
+        self, groww_symbol, start_time, end_time, candle_interval
+    ) -> dict:
+        """Check access and response quality for historical option candles."""
+
 
 ConnectionFactory = Callable[[str, Mapping[str, str]], ProviderConnection]
 
@@ -227,6 +238,34 @@ class ProviderSessionManager:
     def account_insights(self) -> dict:
         try:
             return self._active_connection().get_account_insights()
+        except ProviderError as exc:
+            self._on_provider_error(exc)
+
+    def historical_expiries(self, year: int, month: int) -> list[str]:
+        try:
+            return self._active_connection().get_historical_expiries(year, month)
+        except ValueError as exc:
+            raise ProviderRequestError(str(exc), 422)
+        except ProviderError as exc:
+            self._on_provider_error(exc)
+
+    def historical_contracts(self, expiry_date: str) -> list[str]:
+        try:
+            return self._active_connection().get_historical_contracts(expiry_date)
+        except ValueError as exc:
+            raise ProviderRequestError(str(exc), 422)
+        except ProviderError as exc:
+            self._on_provider_error(exc)
+
+    def check_historical_candles(
+        self, groww_symbol, start_time, end_time, candle_interval
+    ) -> dict:
+        try:
+            return self._active_connection().check_historical_candles(
+                groww_symbol, start_time, end_time, candle_interval
+            )
+        except ValueError as exc:
+            raise ProviderRequestError(str(exc), 422)
         except ProviderError as exc:
             self._on_provider_error(exc)
 

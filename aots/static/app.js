@@ -1,5 +1,16 @@
 const $ = (id) => document.getElementById(id);
 const inr = (n) => new Intl.NumberFormat("en-IN",{style:"currency",currency:"INR",maximumFractionDigits:2}).format(Number(n||0));
+document.querySelectorAll(".app-tab").forEach(button => {
+  button.addEventListener("click", () => {
+    const selected = button.dataset.tab;
+    document.querySelectorAll(".app-tab").forEach(tab => {
+      tab.setAttribute("aria-pressed", String(tab === button));
+    });
+    document.querySelectorAll("[data-app-tab]").forEach(panel => {
+      panel.hidden = panel.dataset.appTab !== selected;
+    });
+  });
+});
 let pendingEntryKey = null;
 let entryRequestActive = false;
 async function api(path, options={}) {
@@ -317,6 +328,177 @@ async function refreshAccountInsights() {
   }
 }
 $("account-insights-refresh").addEventListener("click", refreshAccountInsights);
+
+const historicalMonthSelect = $("historical-expiry-form").elements.month;
+for(let month = 1; month <= 12; month++) {
+  const option = document.createElement("option");
+  option.value = String(month);
+  option.textContent = new Intl.DateTimeFormat("en-IN", {month:"long"}).format(new Date(2024, month - 1, 1));
+  historicalMonthSelect.appendChild(option);
+}
+historicalMonthSelect.value = String(new Date().getMonth() + 1);
+let historicalRequestGeneration = 0;
+let historicalRequestActive = false;
+function updateHistoricalControls() {
+  $("historical-expiry-load").disabled = historicalRequestActive;
+  $("historical-contracts-load").disabled =
+    historicalRequestActive || !$("historical-expiry").value;
+  $("historical-candles-check").disabled =
+    historicalRequestActive || !$("historical-contract").value;
+}
+function historicalStatus(state, message) {
+  const labels = {
+    checking:"Checking",
+    available:"Data returned",
+    empty:"No data",
+    denied:"Access denied",
+    unauthorized:"Reconnect required",
+    failed:"Check failed",
+  };
+  $("historical-check-status").textContent = labels[state];
+  $("historical-check-status").dataset.state = state;
+  $("historical-check-message").textContent = message;
+  $("historical-check-message").className =
+    state === "available" ? "positive" :
+    ["denied", "unauthorized", "failed"].includes(state) ? "negative" : "muted";
+}
+function historicalFailure(error) {
+  const state = error.status === 403 ? "denied" :
+    error.status === 401 ? "unauthorized" : "failed";
+  const message = error.status === 403 ?
+    "Groww denied access. The specific cause may require verification." : error.message;
+  historicalStatus(state, message);
+  if(state === "unauthorized") loadProviderStatus();
+}
+function resetHistoricalContracts() {
+  const expiry = $("historical-expiry");
+  expiry.innerHTML = '<option value="">Load expiries first</option>';
+  expiry.disabled = true;
+  $("historical-contracts-load").disabled = true;
+  resetHistoricalContractOptions();
+}
+function resetHistoricalContractOptions() {
+  const contract = $("historical-contract");
+  contract.innerHTML = '<option value="">Load contracts first</option>';
+  contract.disabled = true;
+  $("historical-candles-check").disabled = true;
+}
+function updateHistoricalContractSelection() {
+  $("historical-candles-check").disabled = !$("historical-contract").value;
+}
+$("historical-expiry-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if(historicalRequestActive) return;
+  const generation = ++historicalRequestGeneration;
+  const form = event.currentTarget;
+  const query = new URLSearchParams({
+    year: form.elements.year.value,
+    month: form.elements.month.value,
+  });
+  historicalRequestActive = true;
+  updateHistoricalControls();
+  resetHistoricalContracts();
+  $("historical-check-result").hidden = true;
+  historicalStatus("checking", "Requesting NIFTY historical expiries from Groww…");
+  try {
+    const response = await api(`/api/provider/historical/expiries?${query}`);
+    if(generation !== historicalRequestGeneration) return;
+    const expiry = $("historical-expiry");
+    expiry.replaceChildren(new Option("Choose an expiry", ""));
+    for(const item of response.expiries) expiry.add(new Option(item, item));
+    expiry.disabled = response.expiries.length === 0;
+    $("historical-contracts-load").disabled = response.expiries.length === 0;
+    updateHistoricalControls();
+    historicalStatus(response.expiries.length ? "available" : "empty", response.expiries.length ?
+      `${response.expiries.length} expiry date(s) returned. Select one, then load its contracts.` :
+      "Request succeeded but no expiries were returned for that month.");
+  } catch(error) {
+    if(generation !== historicalRequestGeneration) return;
+    historicalFailure(error);
+  } finally {
+    historicalRequestActive = false;
+    updateHistoricalControls();
+  }
+});
+$("historical-expiry").addEventListener("change", () => {
+  resetHistoricalContractOptions();
+  $("historical-contracts-load").disabled = !$("historical-expiry").value;
+});
+$("historical-contracts-load").addEventListener("click", async () => {
+  if(historicalRequestActive) return;
+  const generation = ++historicalRequestGeneration;
+  const expiry = $("historical-expiry").value;
+  if(!expiry) return;
+  historicalRequestActive = true;
+  updateHistoricalControls();
+  resetHistoricalContractOptions();
+  historicalStatus("checking", "Requesting contracts for the selected expiry from Groww…");
+  try {
+    const query = new URLSearchParams({expiry_date:expiry});
+    const response = await api(`/api/provider/historical/contracts?${query}`);
+    if(generation !== historicalRequestGeneration) return;
+    const contract = $("historical-contract");
+    contract.replaceChildren(new Option("Choose a NIFTY option contract", ""));
+    for(const item of response.contracts) contract.add(new Option(item, item));
+    contract.disabled = response.contracts.length === 0;
+    updateHistoricalContractSelection();
+    updateHistoricalControls();
+    historicalStatus(response.contracts.length ? "available" : "empty", response.contracts.length ?
+      `${response.contracts.length} NIFTY option contract(s) returned. Select one and test candles.` :
+      "Request succeeded but no option contracts were returned for that expiry.");
+  } catch(error) {
+    if(generation !== historicalRequestGeneration) return;
+    historicalFailure(error);
+  } finally {
+    historicalRequestActive = false;
+    updateHistoricalControls();
+  }
+});
+$("historical-contract").addEventListener("change", updateHistoricalContractSelection);
+$("historical-candles-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const contract = $("historical-contract").value;
+  if(!contract || historicalRequestActive) return;
+  const generation = ++historicalRequestGeneration;
+  const form = event.currentTarget;
+  historicalRequestActive = true;
+  updateHistoricalControls();
+  $("historical-check-result").hidden = true;
+  historicalStatus("checking", "Checking historical FNO candle access…");
+  try {
+    const result = await api("/api/provider/historical/candles/check", {
+      method:"POST",
+      body:JSON.stringify({
+        groww_symbol:contract,
+        start_time:form.elements.start_time.value,
+        end_time:form.elements.end_time.value,
+        candle_interval:form.elements.candle_interval.value,
+      }),
+    });
+    if(generation !== historicalRequestGeneration) return;
+    $("historical-candle-count").textContent = Number(result.candle_count).toLocaleString("en-IN");
+    $("historical-first-timestamp").textContent = result.first_timestamp || "—";
+    $("historical-last-timestamp").textContent = result.last_timestamp || "—";
+    $("historical-invalid-count").textContent = Number(result.invalid_ohlc_count).toLocaleString("en-IN");
+    $("historical-quality-warnings").textContent = [
+      ...(result.quality_warnings || []),
+      result.timestamps_timezone,
+    ].filter(Boolean).join(" ");
+    $("historical-check-result").hidden = false;
+    const state = result.status === "available" ? "available" : "empty";
+    const message = result.status === "available" ?
+      "Groww returned historical candles for this contract and window. This is a data-access diagnostic, not a backtest." :
+      "The request succeeded but Groww returned no candles. Availability for other contracts or dates is not established.";
+    historicalStatus(state, message);
+  } catch(error) {
+    if(generation !== historicalRequestGeneration) return;
+    historicalFailure(error);
+  } finally {
+    historicalRequestActive = false;
+    updateHistoricalControls();
+  }
+});
+resetHistoricalContracts();
 
 let replaySessionId = null;
 let replayLastSequence = 0;

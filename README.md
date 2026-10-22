@@ -46,7 +46,7 @@ uvicorn aots.api:app --reload
 
 Open http://127.0.0.1:8000. Run tests with `pytest`.
 
-The dashboard starts in paper mode with an empty ledger. Use the API docs at `/docs` to inspect endpoints. The sample trade endpoint creates a **simulated** paper trade for testing; it does not submit any broker order.
+The dashboard starts in paper mode with an empty ledger. The Paper Trading and Groww sections are separate; historical-data requests occur only after an explicit user action and remain separate from simulated capital and the paper ledger. Use the API docs at `/docs` to inspect endpoints. The sample trade endpoint creates a **simulated** paper trade for testing; it does not submit any broker order.
 
 ## API quick reference
 
@@ -214,6 +214,9 @@ Endpoints:
 - `GET /api/provider/quote?symbol=NIFTY`
 - `GET /api/provider/option-chain?underlying=NIFTY&expiry=YYYY-MM-DD`
 - `GET /api/provider/account-insights`
+- `GET /api/provider/historical/expiries?year=2024&month=1`
+- `GET /api/provider/historical/contracts?expiry_date=2024-01-04`
+- `POST /api/provider/historical/candles/check` — validate a bounded, read-only NIFTY option-candle response
 
 Connect body (Groww; Kite is listed but disabled and rejected until its adapter exists):
 
@@ -229,14 +232,16 @@ Credential and token lifecycle:
 - Groww token exchange follows the official docs: `POST /v1/token/api/access` uses the supplied API key in the Authorization header. The approval flow sends `key_type=approval` with checksum `sha256(secret + epoch_seconds)` and timestamp. The TOTP flow sends `key_type=totp` with a generated RFC 6238 code from the supplied seed.
 - Access tokens are treated as expiring at the next 06:00 IST boundary (per official docs). Expired/invalid tokens force a safe failed state and require reconnect.
 - Read-only market data is normalized through the backend using official endpoints (`/v1/live-data/quote` and `/v1/option-chain/exchange/{exchange}/underlying/{underlying}` with `expiry_date=YYYY-MM-DD`). The application currently supports `NSE/NIFTY` for this runtime slice.
-- Account insights use Groww's official Portfolio and Margin endpoints: `/v1/positions/user?segment=FNO`, `/v1/positions/user?segment=CASH`, `/v1/holdings/user`, and `/v1/margins/detail/user`. Groww documents `positions[].realised_pnl` but gives it no explicit daily time scope, so it is shown only as "reported realised P&L (scope unspecified)." Today's P&L is explicitly unavailable: AOTS does not infer it from that value, holdings, or balances, and the current free Cloud plan excludes Live Data, needed for a defensible unrealised component.
+- Account insights use Groww's official Portfolio and Margin endpoints: `/v1/positions/user?segment=FNO`, `/v1/positions/user?segment=CASH`, `/v1/holdings/user`, and `/v1/margins/detail/user`. Groww documents `positions[].realised_pnl` but gives it no explicit daily time scope, so it is shown only as "reported realised P&L (scope unspecified)." Today's P&L is explicitly unavailable: AOTS does not infer it from that value, holdings, or balances, and this account-insights path does not retrieve per-position live marks.
+- The Groww tab offers a manual historical-data capability check using Groww's documented `/v1/historical/expiries`, `/v1/historical/contracts`, and `/v1/historical/candles` endpoints. Groww documents FNO history from 2020 and describes option candle OHLC, volume and open interest in rupees. The diagnostic is limited to NIFTY option contracts, 5- or 15-minute intervals, and one calendar day per candle request. It does not create trades, store candles, alter paper trades/risk, or call any order API. Endpoint access depends on each account's Groww entitlement; a 403 is reported as access denied but does not identify the specific permission or subscription.
+- Historical candle timestamps are documented without an offset. AOTS preserves their wall-clock values and does not claim their timezone convention or session completeness is verified. Invalid OHLC/OI values, duplicate timestamps and ordering/range concerns are surfaced as warnings. The check is a capability/data-quality diagnostic, not a historical options backtest.
 - `clear_cash` is displayed as Groww-reported available cash. Other margin values (`collateral_available`, FNO option/future balances, and CNC/MIS balances) are shown separately and are not summed. Missing provider fields remain unavailable (`null`), distinct from numeric zero. Account insights are fetched only on the panel's manual refresh, not during normal dashboard refresh.
 - Positions and holdings use only documented provider fields. A successful account snapshot carries a backend refresh timestamp; on a failed refresh, previously displayed data remains labelled stale with its prior timestamp. Auth failures expire the local session and require reconnection.
 - Limitation: Python cannot securely erase immutable strings. Dropping references makes the values eligible for garbage collection, but copies may remain in process memory until then (and in the request body buffers of the web server).
 
 ## Groww integration boundary
 
-See `docs/GROWW_INTEGRATION.md`. Groww's official API documentation describes authentication, market data, account/portfolio endpoints, order APIs, and WebSocket capabilities. AOTS uses only read-only endpoints and does not invoke live order endpoints. Access to specific endpoints depends on Groww account permissions and subscription; the current free Cloud tier used for this sprint excludes Live Data and Backtesting APIs.
+See `docs/GROWW_INTEGRATION.md`. Groww's official API documentation describes authentication, market data, account/portfolio endpoints, historical data, order APIs, and WebSocket capabilities. AOTS uses only read-only endpoints and does not invoke live order endpoints. Access to specific endpoints depends on Groww account permissions and subscription; the historical-data diagnostic reports the user's observed response and does not assume an entitlement from documentation or plan labels.
 
 ## Historical NIFTY ORB research backtest
 

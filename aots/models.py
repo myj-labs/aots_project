@@ -1,6 +1,6 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def utc_now() -> datetime:
@@ -107,6 +107,39 @@ class HistoricalReplayRequest(BaseModel):
             raise ValueError("Historical replay is limited to a 60-calendar-day request window.")
         if self.allow_stale_cache and not self.offline:
             raise ValueError("allow_stale_cache requires offline mode.")
+        return self
+
+
+class HistoricalCandlesCheckRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    groww_symbol: str = Field(min_length=1, max_length=80)
+    start_time: datetime
+    end_time: datetime
+    candle_interval: Literal["5minute", "15minute"]
+
+    @field_validator("groww_symbol")
+    @classmethod
+    def require_trimmed_symbol(cls, value: str) -> str:
+        if not value.strip() or value != value.strip():
+            raise ValueError("groww_symbol must not be empty or have surrounding whitespace.")
+        return value
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def require_local_wall_clock(cls, value: datetime) -> datetime:
+        if value.tzinfo is not None and value.utcoffset() is not None:
+            raise ValueError("Historical timestamps must be local exchange times without a timezone offset.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_candle_window(self):
+        if self.start_time < datetime(2020, 1, 1):
+            raise ValueError("Historical data requests must start on or after 2020-01-01.")
+        if self.end_time <= self.start_time:
+            raise ValueError("end_time must be later than start_time.")
+        if self.end_time - self.start_time > timedelta(days=1):
+            raise ValueError("Historical candle checks are limited to a one-day request window.")
         return self
 
 

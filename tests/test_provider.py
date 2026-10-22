@@ -850,3 +850,610 @@ window.fetch = async (path, options) => {{
     assert all(MARKER not in url for url in snapshot["urls"])
     assert snapshot["storage"] == [0, 0, ""]
     assert snapshot["status"] == "Disconnected"
+
+
+def test_historical_expiry_contract_and_candle_diagnostic_is_read_only(provider_env):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    symbol = "NSE-NIFTY-04Jan24-19200-CE"
+    mgr, _, transports = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678", "isActive": True}),
+            (200, {"status": "SUCCESS", "payload": {"expiries": ["2024-01-04"]}}),
+            (200, {"status": "SUCCESS", "payload": {"contracts": [symbol]}}),
+            (
+                200,
+                {
+                    "status": "SUCCESS",
+                    "payload": {
+                        "candles": [
+                            ["2024-01-03T09:15:00", 100, 105, 99, 103, 1000, 2000],
+                            ["2024-01-03T09:30:00", 103, 106, 102, 105, 1200, 2200],
+                        ]
+                    },
+                },
+            ),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        before_events = provider_env.db.events()
+        before_trades = provider_env.db.trades()
+        before_risk = api.risk.snapshot()
+        expiries = client.get(
+            "/api/provider/historical/expiries?year=2024&month=1"
+        )
+        contracts = client.get(
+            "/api/provider/historical/contracts?expiry_date=2024-01-04"
+        )
+        candles = client.post(
+            "/api/provider/historical/candles/check",
+            json={
+                "groww_symbol": symbol,
+                "start_time": "2024-01-03T09:15",
+                "end_time": "2024-01-03T09:30",
+                "candle_interval": "15minute",
+            },
+        )
+        after_events = provider_env.db.events()
+        after_trades = provider_env.db.trades()
+        after_risk = api.risk.snapshot()
+
+    assert expiries.status_code == 200 and expiries.json()["expiries"] == ["2024-01-04"]
+    assert contracts.status_code == 200 and contracts.json()["contracts"] == [symbol]
+    result = candles.json()
+    assert candles.status_code == 200
+    assert result["status"] == "available"
+    assert result["candle_count"] == 2
+    assert result["first_timestamp"] == "2024-01-03T09:15:00"
+    assert result["last_timestamp"] == "2024-01-03T09:30:00"
+    assert result["invalid_ohlc_count"] == 0
+    assert "timezone is verified" in result["timestamps_timezone"]
+    assert after_events == before_events
+    assert after_trades == before_trades == []
+    assert after_risk == before_risk
+
+    calls = transports[0].calls
+    assert [call[0] for call in calls] == ["POST", "GET", "GET", "GET"]
+    assert ["/v1/historical/" in call[1] for call in calls] == [False, True, True, True]
+    assert all(call[1].startswith("https://api.groww.in/") for call in calls)
+    assert all(call[2].get("X-API-VERSION") == "1.0" for call in calls[1:])
+    assert all(call[2].get("Authorization") == "Bearer tok-12345678" for call in calls[1:])
+
+
+@pytest.mark.parametrize(
+    ("candles", "expected_status", "expected_count", "warning"),
+    [
+        ([], "no_data", 0, None),
+        (
+            [["2024-01-03T09:15:00", 100, 99, 101, 98, -1, -2]],
+            "available",
+            1,
+            "invalid OHLC",
+        ),
+        (
+            [
+                ["2024-01-03T09:30:00", 100, 105, 99, 103, 1000, None],
+                ["2024-01-03T09:30:00", 103, 106, 102, 105, 1200, None],
+            ],
+            "available",
+            2,
+            "Duplicate candle timestamps",
+        ),
+        (
+            [["2024-01-03T09:45:00", 100, 105, 99, 103, 1000, None]],
+            "available",
+            1,
+            "outside the requested range",
+        ),
+    ],
+)
+def test_historical_candle_diagnostic_reports_empty_and_quality_warnings(
+    provider_env, candles, expected_status, expected_count, warning
+):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    mgr, _, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678"}),
+            (200, {"status": "SUCCESS", "payload": {"candles": candles}}),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.post(
+            "/api/provider/historical/candles/check",
+            json={
+                "groww_symbol": "NSE-NIFTY-04Jan24-19200-CE",
+                "start_time": "2024-01-03T09:15",
+                "end_time": "2024-01-03T09:30",
+                "candle_interval": "15minute",
+            },
+        )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["status"] == expected_status
+    assert result["candle_count"] == expected_count
+    if warning:
+        assert any(warning in item for item in result["quality_warnings"])
+
+
+def test_historical_candle_malformed_timestamp_fails_closed(provider_env):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    mgr, _, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678"}),
+            (
+                200,
+                {
+                    "status": "SUCCESS",
+                    "payload": {"candles": [["not-a-timestamp", 100, 105, 99, 103, 1000, None]]},
+                },
+            ),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.post(
+            "/api/provider/historical/candles/check",
+            json={
+                "groww_symbol": "NSE-NIFTY-04Jan24-19200-CE",
+                "start_time": "2024-01-03T09:15",
+                "end_time": "2024-01-03T09:30",
+                "candle_interval": "15minute",
+            },
+        )
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Provider returned an unexpected response."
+
+
+@pytest.mark.parametrize(
+    ("path", "response_payload"),
+    [
+        ("/api/provider/historical/expiries?year=2024&month=1", {"expiries": "not-a-list"}),
+        (
+            "/api/provider/historical/contracts?expiry_date=2024-01-04",
+            {"contracts": ["NIFTY-UNSCOPED-CE"]},
+        ),
+    ],
+)
+def test_historical_discovery_malformed_payload_fails_closed(
+    provider_env, path, response_payload
+):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    mgr, _, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678"}),
+            (200, {"status": "SUCCESS", "payload": response_payload}),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.get(path)
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Provider returned an unexpected response."
+
+
+def test_historical_expiry_rejects_impossible_user_date_as_client_error(provider_env):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    mgr, _, transports = groww_manager_with_transport(
+        [now], responses=[(200, {"token": "tok-12345678"})]
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.get(
+            "/api/provider/historical/contracts?expiry_date=2024-02-30"
+        )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "expiry must be a real calendar date."
+    assert len(transports[0].calls) == 1
+
+
+def test_historical_expiries_reject_impossible_upstream_date_as_response_error(
+    provider_env,
+):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    mgr, _, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678"}),
+            (
+                200,
+                {
+                    "status": "SUCCESS",
+                    "payload": {
+                        "expiries": ["2024-02-30"],
+                        "sensitive_provider_detail": MARKER,
+                    },
+                },
+            ),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.get("/api/provider/historical/expiries?year=2024&month=2")
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Provider returned an unexpected response."}
+    assert MARKER not in response.text
+
+
+@pytest.mark.parametrize(
+    ("upstream_result", "expected_status", "expected_session_state"),
+    [
+        (
+            (401, {"status": "FAILURE", "error": {"message": MARKER}}),
+            401,
+            "failed",
+        ),
+        (
+            (429, {"status": "FAILURE", "error": {"message": MARKER}}),
+            429,
+            "connected",
+        ),
+        (TimeoutError(MARKER), 503, "connected"),
+    ],
+)
+def test_historical_expiry_route_maps_auth_rate_limit_and_timeout_safely(
+    provider_env, upstream_result, expected_status, expected_session_state
+):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    mgr, _, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678"}),
+            upstream_result,
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.get("/api/provider/historical/expiries?year=2024&month=1")
+        status = client.get("/api/provider/status").json()
+    assert response.status_code == expected_status
+    assert status["state"] == expected_session_state
+    assert MARKER not in response.text
+    assert "tok-12345678" not in response.text
+
+
+def test_historical_provider_failure_is_not_fabricated_as_empty(provider_env):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    mgr, _, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678"}),
+            (503, None),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.get("/api/provider/historical/expiries?year=2024&month=1")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Provider is unreachable or returned a server error."
+
+
+def test_historical_permission_denial_does_not_expire_connected_session(provider_env):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    mgr, _, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678"}),
+            (403, {"status": "FAILURE", "error": {"message": MARKER}}),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.get(
+            "/api/provider/historical/expiries?year=2024&month=1"
+        )
+        status = client.get("/api/provider/status").json()
+    assert response.status_code == 403
+    assert "subscription" in response.json()["detail"]
+    assert MARKER not in response.text
+    assert status["state"] == "connected" and status["configured"] is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "groww_symbol": "NSE-NIFTY-04Jan24-19200-CE",
+            "start_time": "2019-12-31T09:15",
+            "end_time": "2019-12-31T09:30",
+            "candle_interval": "15minute",
+        },
+        {
+            "groww_symbol": "NSE-NIFTY-04Jan24-19200-CE",
+            "start_time": "2024-01-03T09:15",
+            "end_time": "2024-01-04T09:16",
+            "candle_interval": "15minute",
+        },
+        {
+            "groww_symbol": "NSE-NIFTY-04Jan24-19200-CE",
+            "start_time": "2024-01-03T09:15+05:30",
+            "end_time": "2024-01-03T09:30+05:30",
+            "candle_interval": "15minute",
+        },
+        {
+            "groww_symbol": "NSE-NIFTY-04Jan24-19200-CE",
+            "start_time": "2024-01-03T09:15",
+            "end_time": "2024-01-03T09:30",
+            "candle_interval": "1minute",
+        },
+    ],
+)
+def test_historical_candle_request_bounds_reject_before_provider_call(provider_env, payload):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    mgr, _, transports = groww_manager_with_transport(
+        [now], responses=[(200, {"token": "tok-12345678"})]
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.post("/api/provider/historical/candles/check", json=payload)
+    assert response.status_code == 422
+    assert len(transports[0].calls) == 1
+
+
+def test_historical_future_candle_window_is_rejected_without_upstream_request(provider_env):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    mgr, _, transports = groww_manager_with_transport(
+        [now], responses=[(200, {"token": "tok-12345678"})]
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.post(
+            "/api/provider/historical/candles/check",
+            json={
+                "groww_symbol": "NSE-NIFTY-04Jan24-19200-CE",
+                "start_time": "2025-01-03T09:30",
+                "end_time": "2025-01-03T09:45",
+                "candle_interval": "5minute",
+            },
+        )
+    assert response.status_code == 422
+    assert "future" in response.json()["detail"]
+    assert len(transports[0].calls) == 1
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/api/provider/historical/expiries?year=2019&month=1",
+        "/api/provider/historical/expiries?year=2026&month=1",
+        "/api/provider/historical/expiries?year=2024&month=13",
+    ],
+)
+def test_historical_expiry_bounds_reject_without_upstream_request(provider_env, url):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    mgr, _, transports = groww_manager_with_transport(
+        [now], responses=[(200, {"token": "tok-12345678"})]
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.get(url)
+    assert response.status_code == 422
+    assert len(transports[0].calls) == 1
+
+
+@needs_browser
+def test_historical_diagnostic_is_user_triggered_and_stays_out_of_paper_ledger(tmp_path):
+    snapshot = _run_harness_page(tmp_path, f"""<script>
+const calls = [];
+window.fetch = async (path, options={{}}) => {{
+  const url = String(path);
+  calls.push({{url, method:options.method || "GET", body:options.body || null}});
+  let data = {{}};
+  if (url === "/api/strategy/decisions" || url === "/api/trades" || url === "/api/replay") data = [];
+  else if (url === "/api/provider/status") data = {{state:"connected"}};
+  else if (url.startsWith("/api/provider/historical/expiries")) data = {{expiries:["2024-01-04"]}};
+  else if (url.startsWith("/api/provider/historical/contracts")) data = {{contracts:["NSE-NIFTY-04Jan24-19200-CE"]}};
+  else if (url === "/api/provider/historical/candles/check") data = {{
+    status:"available", groww_symbol:"NSE-NIFTY-04Jan24-19200-CE", candle_interval:"15minute",
+    candle_count:1, first_timestamp:"2024-01-03T09:15:00", last_timestamp:"2024-01-03T09:15:00",
+    invalid_ohlc_count:0, quality_warnings:[], timestamps_timezone:"Timezone not verified."
+  }};
+  return {{ok:true,status:200,json:async()=>data}};
+}};
+</script>
+<script src="{(_STATIC_DIR / 'app.js').as_uri()}"></script>
+<script>
+(async () => {{
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  await sleep(80);
+  const automaticHistoricalCalls = calls.filter(call => call.url.includes("/api/provider/historical/")).length;
+  document.querySelector('[data-tab="groww"]').click();
+  const tabs = {{
+    growwSelected:document.querySelector('[data-tab="groww"]').getAttribute("aria-pressed"),
+    providerHidden:document.getElementById("provider-panel").hidden,
+    paperHidden:document.getElementById("historical-replay").hidden,
+  }};
+  const expiryForm = document.getElementById("historical-expiry-form");
+  expiryForm.elements.year.value = "2024";
+  expiryForm.elements.month.value = "1";
+  expiryForm.requestSubmit();
+  await sleep(30);
+  document.getElementById("historical-expiry").value = "2024-01-04";
+  document.getElementById("historical-expiry").dispatchEvent(new Event("change"));
+  document.getElementById("historical-contracts-load").click();
+  await sleep(30);
+  document.getElementById("historical-contract").value = "NSE-NIFTY-04Jan24-19200-CE";
+  document.getElementById("historical-contract").dispatchEvent(new Event("change"));
+  const candleForm = document.getElementById("historical-candles-form");
+  candleForm.elements.start_time.value = "2024-01-03T09:15";
+  candleForm.elements.end_time.value = "2024-01-03T09:30";
+  candleForm.elements.candle_interval.value = "15minute";
+  candleForm.requestSubmit();
+  await sleep(30);
+  const snapshot = {{
+    automaticHistoricalCalls,
+    tabs,
+    historicalCalls:calls.filter(call => call.url.includes("/api/provider/historical/")),
+    candleCount:document.getElementById("historical-candle-count").innerText,
+    paperLedgerHidden:document.getElementById("paper-ledger").hidden,
+  }};
+  const pre = document.createElement("pre");
+  pre.id = "snapshot";
+  pre.textContent = JSON.stringify([snapshot]);
+  document.body.appendChild(pre);
+}})();
+</script>""")[0]
+    assert snapshot["automaticHistoricalCalls"] == 0
+    assert snapshot["tabs"] == {
+        "growwSelected": "true",
+        "providerHidden": False,
+        "paperHidden": True,
+    }
+    assert [call["url"].split("?")[0] for call in snapshot["historicalCalls"]] == [
+        "/api/provider/historical/expiries",
+        "/api/provider/historical/contracts",
+        "/api/provider/historical/candles/check",
+    ]
+    assert snapshot["historicalCalls"][-1]["method"] == "POST"
+    assert json.loads(snapshot["historicalCalls"][-1]["body"]) == {
+        "groww_symbol": "NSE-NIFTY-04Jan24-19200-CE",
+        "start_time": "2024-01-03T09:15",
+        "end_time": "2024-01-03T09:30",
+        "candle_interval": "15minute",
+    }
+    assert snapshot["candleCount"] == "1"
+    assert snapshot["paperLedgerHidden"] is True
+
+
+@needs_browser
+def test_historical_discovery_and_candle_statuses_are_terminal_and_consistent(tmp_path):
+    snapshot = _run_harness_page(tmp_path, f"""<script>
+let expiryMode = "empty";
+let contractMode = "empty";
+let candleMode = 403;
+window.fetch = async path => {{
+  const url = String(path);
+  if (url === "/api/strategy/decisions" || url === "/api/trades" || url === "/api/replay") {{
+    return {{ok:true,status:200,json:async()=>[]}};
+  }}
+  if (url === "/api/status") return {{ok:true,status:200,json:async()=>({{capital_inr:100000}})}};
+  if (url === "/api/risk") return {{ok:true,status:200,json:async()=>({{
+    daily_pnl:0,realised_pnl:0,unrealised_pnl:0,open_positions:0,
+    max_daily_loss_inr:2000,max_trade_risk_pct:.005,max_trade_risk_inr:500,
+    consecutive_losses:0,max_consecutive_losses:3,paused_for_day:false,kill_switch:false
+  }})}};
+  if (url === "/api/provider/status") return {{ok:true,status:200,json:async()=>({{state:"connected"}})}};
+  let mode = "empty";
+  if (url.startsWith("/api/provider/historical/expiries")) mode = expiryMode;
+  else if (url.startsWith("/api/provider/historical/contracts")) mode = contractMode;
+  else if (url === "/api/provider/historical/candles/check") mode = candleMode;
+  if (mode === 401 || mode === 403 || mode === 500) {{
+    return {{ok:false,status:mode,json:async()=>({{detail:"Safe provider failure."}})}};
+  }}
+  if (url.startsWith("/api/provider/historical/expiries")) {{
+    return {{ok:true,status:200,json:async()=>({{expiries:mode === "success" ? ["2024-01-04"] : []}})}};
+  }}
+  if (url.startsWith("/api/provider/historical/contracts")) {{
+    return {{ok:true,status:200,json:async()=>({{
+      contracts:mode === "success" ? ["NSE-NIFTY-04Jan24-19200-CE"] : []
+    }})}};
+  }}
+  return {{ok:true,status:200,json:async()=>({{
+    status:"available",candle_count:1,first_timestamp:"2024-01-03T09:15:00",
+    last_timestamp:"2024-01-03T09:15:00",invalid_ohlc_count:0,
+    quality_warnings:[],timestamps_timezone:"Timezone not verified."
+  }})}};
+}};
+</script>
+<script src="{(_STATIC_DIR / 'app.js').as_uri()}"></script>
+<script>
+(async () => {{
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const waitFor = async expected => {{
+    for(let i=0; i<100; i++) {{
+      if(document.getElementById("historical-check-status").innerText === expected) return;
+      await sleep(10);
+    }}
+    throw new Error("Timed out waiting for historical status: " + expected);
+  }};
+  await sleep(80);
+  document.querySelector('[data-tab="groww"]').click();
+  const expiryForm = document.getElementById("historical-expiry-form");
+  const checkExpiry = async (mode, expected) => {{
+    expiryMode = mode;
+    expiryForm.requestSubmit();
+    await waitFor(expected);
+    return document.getElementById("historical-check-message").innerText;
+  }};
+  const expiryEmpty = await checkExpiry("empty", "No data");
+  const expirySuccess = await checkExpiry("success", "Data returned");
+  const expiryDenied = await checkExpiry(403, "Access denied");
+  const expiryUnauthorized = await checkExpiry(401, "Reconnect required");
+
+  const expiry = document.getElementById("historical-expiry");
+  expiry.replaceChildren(new Option("2024-01-04", "2024-01-04"));
+  expiry.disabled = false;
+  expiry.value = "2024-01-04";
+  expiry.dispatchEvent(new Event("change"));
+  const contractsButton = document.getElementById("historical-contracts-load");
+  const checkContracts = async (mode, expected) => {{
+    contractMode = mode;
+    contractsButton.click();
+    await waitFor(expected);
+    return document.getElementById("historical-check-message").innerText;
+  }};
+  const contractsEmpty = await checkContracts("empty", "No data");
+  const contractsDenied = await checkContracts(403, "Access denied");
+  const contractsUnauthorized = await checkContracts(401, "Reconnect required");
+
+  const contract = document.getElementById("historical-contract");
+  contract.replaceChildren(new Option("NIFTY option", "NSE-NIFTY-04Jan24-19200-CE"));
+  contract.disabled = false;
+  contract.value = "NSE-NIFTY-04Jan24-19200-CE";
+  contract.dispatchEvent(new Event("change"));
+  const candleForm = document.getElementById("historical-candles-form");
+  candleForm.elements.start_time.value = "2024-01-03T09:15";
+  candleForm.elements.end_time.value = "2024-01-03T09:30";
+  candleForm.elements.candle_interval.value = "15minute";
+  const checkCandles = async (mode, expected) => {{
+    candleMode = mode;
+    candleForm.requestSubmit();
+    await waitFor(expected);
+    return document.getElementById("historical-check-message").innerText;
+  }};
+  const candlesDenied = await checkCandles(403, "Access denied");
+  const candlesUnauthorized = await checkCandles(401, "Reconnect required");
+  const candlesFailed = await checkCandles(500, "Check failed");
+  const out = [{{
+    expiryEmpty, expirySuccess, expiryDenied, expiryUnauthorized,
+    contractsEmpty, contractsDenied, contractsUnauthorized,
+    candlesDenied, candlesUnauthorized, candlesFailed,
+    finalState:document.getElementById("historical-check-status").dataset.state
+  }}];
+  const pre = document.createElement("pre");
+  pre.id = "snapshot";
+  pre.textContent = JSON.stringify(out);
+  document.body.appendChild(pre);
+}})();
+</script>""")[0]
+    assert snapshot["expiryEmpty"] == "Request succeeded but no expiries were returned for that month."
+    assert "expiry date(s) returned" in snapshot["expirySuccess"]
+    assert snapshot["expiryDenied"] == (
+        "Groww denied access. The specific cause may require verification."
+    )
+    assert snapshot["expiryUnauthorized"] == "Safe provider failure."
+    assert snapshot["contractsEmpty"] == (
+        "Request succeeded but no option contracts were returned for that expiry."
+    )
+    assert snapshot["contractsDenied"] == snapshot["expiryDenied"]
+    assert snapshot["contractsUnauthorized"] == "Safe provider failure."
+    assert snapshot["candlesDenied"] == snapshot["expiryDenied"]
+    assert snapshot["candlesUnauthorized"] == "Safe provider failure."
+    assert snapshot["candlesFailed"] == "Safe provider failure."
+    assert snapshot["finalState"] == "failed"

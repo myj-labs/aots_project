@@ -13,6 +13,7 @@ from .models import (
     MarkPriceRequest,
     KillSwitchRequest,
     HistoricalReplayRequest,
+    HistoricalCandlesCheckRequest,
     StrategyEvaluationRequest,
 )
 from .paper import PaperBroker
@@ -106,6 +107,35 @@ def provider_option_chain(underlying: str = "NIFTY", expiry: str = ""):
 def provider_account_insights():
     try:
         return provider_session.account_insights()
+    except ProviderRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.get("/api/provider/historical/expiries")
+def provider_historical_expiries(
+    year: int = Query(ge=2020, le=2100),
+    month: int = Query(ge=1, le=12),
+):
+    try:
+        return {"expiries": provider_session.historical_expiries(year, month)}
+    except ProviderRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.get("/api/provider/historical/contracts")
+def provider_historical_contracts(expiry_date: str = Query(min_length=10, max_length=10)):
+    try:
+        return {"contracts": provider_session.historical_contracts(expiry_date)}
+    except ProviderRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.post("/api/provider/historical/candles/check")
+def provider_historical_candles_check(req: HistoricalCandlesCheckRequest):
+    try:
+        return provider_session.check_historical_candles(
+            req.groww_symbol, req.start_time, req.end_time, req.candle_interval
+        )
     except ProviderRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
