@@ -9,7 +9,7 @@
 - `aots.strategy`: pluggable protocol, safe no-op, and deterministic supplied-input threshold demonstration
 - `aots.strategy_service`: pure decision evaluation and explicit risk-gated paper processing
 - `aots.brokers.base`: read-only broker contract
-- `aots.brokers.groww`: placeholder read-only adapter boundary
+- `aots.brokers.groww`: runtime Groww authentication, read-only market/account data, and a bounded historical-data capability diagnostic
 - `aots.database`: SQLite persistence for trades, app state and audit events
 - `aots.backtest`: yfinance acquisition/cache, OHLC quality gate, shared chronological underlying-only ORB executor, in-memory replay service, and research reports; replay remains separate from paper trading
 
@@ -44,6 +44,12 @@ The additive `strategy_decisions` table is keyed by `(strategy_id, observation_i
 Replay sessions, bounded event histories, progress, and results are held only in the current process. The service allows at most three concurrent sessions, retains up to 20 sessions, and keeps up to 500 events per session. Status and event polling do not block bar execution; processing runs in a worker thread. Stop takes effect at the next bar-processing boundary; pause/resume and persistence across server restarts are not implemented.
 
 Replay results are research-only NIFTY index points under the batch engine's zero-cost assumptions. While a replay position is open, its unrealized points are marked to the most recently processed candle close. They are not option P&L or rupee capital results. The replay service does not use the paper broker, `RiskEngine`, SQLite trade/event ledger, Groww provider, or Groww account balance. The UI displays replay outputs in a dedicated section and keeps them separate from paper trades and account insights. Historical Yahoo candle-label convention remains an unverified assumption as documented in the backtest section.
+
+## Groww historical-data capability check
+
+The Groww dashboard section contains separate connection/account-insights and historical simulation capability-check panels. Historical expiries and contracts are retrieved only after the corresponding user action. Candle checks use Groww's documented NIFTY FNO historical endpoint, are limited to one day and the documented 5-/15-minute examples, and return a compact quality summary without storing candles or writing to the paper trade/risk ledger. A 403 indicates access denied but does not identify which account entitlement is missing. No Groww order endpoint is called.
+
+Groww documents historical FNO availability from 2020. Its candle timestamps have no timezone offset; AOTS preserves their wall-clock values and does not treat them as verified IST or assert exchange-session completeness. The diagnostic does not simulate option trades or P&L.
 
 ## API security
 

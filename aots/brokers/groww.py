@@ -28,6 +28,7 @@ from .base import (
     OptionStrike,
     ProviderAuthError,
     ProviderError,
+    ProviderPermissionError,
     ProviderRateLimitError,
     ProviderRejectedError,
     ProviderResponseError,
@@ -73,11 +74,15 @@ API_VERSION = "1.0"
 REQUEST_TIMEOUT_SECONDS = 10.0
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_STRIKES = 2_000
+MAX_HISTORICAL_EXPIRIES = 100
+MAX_HISTORICAL_CONTRACTS = 5_000
+MAX_HISTORICAL_CANDLES = 2_000
 IST = timezone(timedelta(hours=5, minutes=30))
 SUPPORTED_INDEX = "NIFTY"
 SUPPORTED_EXCHANGE = "NSE"
 _TOKEN_RE = re.compile(r"^[\x21-\x7e]{8,4096}$")
 _EXPIRY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_GROWW_OPTION_SYMBOL_RE = re.compile(r"^NSE-NIFTY-[A-Za-z0-9.-]{1,64}-(CE|PE)$")
 
 
 class TransportError(Exception):
@@ -285,10 +290,15 @@ class GrowwRuntimeConnection:
                 if auth
                 else "Groww rejected the access token (invalid or expired); reconnect."
             )
-        if status in (401, 403):
+        if status == 401:
             raise ProviderAuthError(
                 "Groww rejected the credentials." if auth
                 else "Groww rejected the access token (invalid or expired); reconnect."
+            )
+        if status == 403:
+            raise ProviderPermissionError(
+                "Groww denied access to this resource; confirm the endpoint is enabled "
+                "for your account and subscription."
             )
         if status == 429:
             raise ProviderRateLimitError()
@@ -373,6 +383,154 @@ class GrowwRuntimeConnection:
             strikes=strikes,
         )
 
+    def get_historical_expiries(self, year: int, month: int) -> list[str]:
+        current_year = self._clock().astimezone(IST).year
+        if year < 2020 or year > current_year:
+            raise ValueError(f"year must be between 2020 and {current_year}.")
+        if month < 1 or month > 12:
+            raise ValueError("month must be between 1 and 12.")
+        payload = self._get(
+            "/v1/historical/expiries",
+            {
+                "exchange": SUPPORTED_EXCHANGE,
+                "underlying_symbol": SUPPORTED_INDEX,
+                "year": str(year),
+                "month": str(month),
+            },
+        )
+        expiries = payload.get("expiries")
+        if (
+            not isinstance(expiries, list)
+            or len(expiries) > MAX_HISTORICAL_EXPIRIES
+            or any(not isinstance(value, str) for value in expiries)
+        ):
+            raise ProviderResponseError()
+        try:
+            validated = [validate_expiry(value) for value in expiries]
+        except ValueError:
+            raise ProviderResponseError() from None
+        if len(set(validated)) != len(validated):
+            raise ProviderResponseError()
+        return validated
+
+    def get_historical_contracts(self, expiry_date: str) -> list[str]:
+        validate_expiry(expiry_date)
+        payload = self._get(
+            "/v1/historical/contracts",
+            {
+                "exchange": SUPPORTED_EXCHANGE,
+                "underlying_symbol": SUPPORTED_INDEX,
+                "expiry_date": expiry_date,
+            },
+        )
+        contracts = payload.get("contracts")
+        if (
+            not isinstance(contracts, list)
+            or len(contracts) > MAX_HISTORICAL_CONTRACTS
+            or any(
+                not isinstance(value, str)
+                or not _GROWW_OPTION_SYMBOL_RE.fullmatch(value)
+                for value in contracts
+            )
+        ):
+            raise ProviderResponseError()
+        if len(set(contracts)) != len(contracts):
+            raise ProviderResponseError()
+        return contracts
+
+    def check_historical_candles(
+        self,
+        groww_symbol: str,
+        start_time: datetime,
+        end_time: datetime,
+        candle_interval: str,
+    ) -> dict[str, Any]:
+        if not _GROWW_OPTION_SYMBOL_RE.fullmatch(groww_symbol):
+            raise ValueError("Choose a NIFTY option contract returned by Groww.")
+        if candle_interval not in {"5minute", "15minute"}:
+            raise ValueError("candle_interval must be 5minute or 15minute.")
+        if start_time.tzinfo is not None or end_time.tzinfo is not None:
+            raise ValueError("Historical timestamps must be local exchange times without an offset.")
+        if start_time < datetime(2020, 1, 1):
+            raise ValueError("Historical data requests must start on or after 2020-01-01.")
+        if end_time <= start_time or end_time - start_time > timedelta(days=1):
+            raise ValueError("Choose an end time after the start, within a one-day request window.")
+        local_now = self._clock().astimezone(IST).replace(tzinfo=None)
+        if end_time > local_now:
+            raise ValueError("Historical candle requests cannot end in the future.")
+        payload = self._get(
+            "/v1/historical/candles",
+            {
+                "exchange": SUPPORTED_EXCHANGE,
+                "segment": "FNO",
+                "groww_symbol": groww_symbol,
+                "start_time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "end_time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "candle_interval": candle_interval,
+            },
+        )
+        candles = payload.get("candles")
+        if not isinstance(candles, list) or len(candles) > MAX_HISTORICAL_CANDLES:
+            raise ProviderResponseError()
+
+        parsed: list[tuple[datetime, list[Any]]] = []
+        for candle in candles:
+            if not isinstance(candle, list) or len(candle) not in (6, 7):
+                raise ProviderResponseError()
+            timestamp = candle[0]
+            if not isinstance(timestamp, str):
+                raise ProviderResponseError()
+            try:
+                parsed_time = datetime.fromisoformat(timestamp)
+            except ValueError:
+                raise ProviderResponseError() from None
+            if parsed_time.tzinfo is not None:
+                raise ProviderResponseError()
+            prices = [_number(value) for value in candle[1:5]]
+            volume = _number(candle[5])
+            open_interest = _number(candle[6], allow_none=True) if len(candle) == 7 else None
+            parsed.append((parsed_time, [*prices, volume, open_interest]))
+
+        warnings: list[str] = []
+        timestamps = [timestamp for timestamp, _ in parsed]
+        if len(set(timestamps)) != len(timestamps):
+            warnings.append("Duplicate candle timestamps were returned.")
+        if timestamps != sorted(timestamps):
+            warnings.append("Candles were not returned in chronological order.")
+        if any(timestamp < start_time or timestamp > end_time for timestamp in timestamps):
+            warnings.append("One or more candle timestamps fell outside the requested range.")
+        invalid_ohlc_count = 0
+        for _, values in parsed:
+            open_price, high, low, close, volume, open_interest = values
+            if (
+                high < low
+                or high < max(open_price, close)
+                or low > min(open_price, close)
+                or min(open_price, high, low, close) < 0
+                or volume < 0
+                or (open_interest is not None and open_interest < 0)
+            ):
+                invalid_ohlc_count += 1
+        if invalid_ohlc_count:
+            warnings.append(
+                f"{invalid_ohlc_count} candle(s) had invalid OHLC, volume, or open-interest values."
+            )
+
+        return {
+            "status": "available" if parsed else "no_data",
+            "groww_symbol": groww_symbol,
+            "candle_interval": candle_interval,
+            "candle_count": len(parsed),
+            "first_timestamp": timestamps[0].isoformat() if timestamps else None,
+            "last_timestamp": timestamps[-1].isoformat() if timestamps else None,
+            "invalid_ohlc_count": invalid_ohlc_count,
+            "quality_warnings": warnings,
+            "timestamps_timezone": (
+                "Groww's documented response has no timezone offset; AOTS does not "
+                "claim the provider's timestamp timezone is verified."
+            ),
+        }
+
     def get_account_insights(self) -> dict[str, Any]:
         positions = self._account_section(
             lambda: self._get("/v1/positions/user", {"segment": "FNO"}),
@@ -398,8 +556,8 @@ class GrowwRuntimeConnection:
                 "value": None,
                 "reason": (
                     "Groww's documented positions field reports realised P&L but does not "
-                    "specify a daily time scope. The free access tier excludes Live Data, "
-                    "so AOTS cannot defensibly calculate today's unrealised P&L."
+                    "specify a daily time scope. This account-insights path does not retrieve "
+                    "per-position live marks, so AOTS cannot calculate today's unrealised P&L."
                 ),
             },
             "positions": self._combine_position_sections(positions, cash_positions),

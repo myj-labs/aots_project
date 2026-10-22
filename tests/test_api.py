@@ -40,6 +40,9 @@ def test_dashboard_loads():
     assert r.status_code == 200
     assert "AOTS" in r.text
     assert "PAPER MODE" in r.text
+    assert "Paper Trading" in r.text
+    assert "Historical Simulation capability check" in r.text
+    assert "Groww account insights" in r.text
     for label in (
         "Realised today",
         "Open unrealised",
@@ -60,6 +63,9 @@ def test_dashboard_loads():
     assert "Open unrealised" in script.text
     assert "Closed realised" in script.text
     assert 'timeZone:"Asia/Kolkata"' in script.text
+    assert "/api/provider/historical/expiries" in script.text
+    assert "/api/provider/historical/contracts" in script.text
+    assert "/api/provider/historical/candles/check" in script.text
 
 
 def test_mark_endpoint_requires_observation_sequence():

@@ -22,7 +22,11 @@
   <section class="warning">
     <strong>Paper trading only.</strong> Simulated orders never reach Groww. Marks are entered manually; there is no live market-data feed or source observation timestamp, so mark freshness is unavailable. The local kill switch blocks new paper entries; it does not cancel broker orders or square off a real account.
   </section>
-  <section class="panel replay-panel" id="historical-replay">
+  <nav class="app-tabs" aria-label="Application sections">
+    <button type="button" class="app-tab" data-tab="paper" aria-pressed="true">Paper Trading</button>
+    <button type="button" class="app-tab" data-tab="groww" aria-pressed="false">Groww</button>
+  </nav>
+  <section class="panel replay-panel" id="historical-replay" data-app-tab="paper">
     <div class="panel-heading">
       <div>
         <h2>Historical NIFTY ORB replay</h2>
@@ -63,7 +67,7 @@
     <h3>Completed replay trades</h3>
     <div class="table-wrap"><table><thead><tr><th>Session</th><th>Direction</th><th>Entry (index points)</th><th>Exit (index points)</th><th>Exit reason</th><th>Gross points</th></tr></thead><tbody id="replay-trades"><tr><td colspan="6" class="muted">No completed replay trades.</td></tr></tbody></table></div>
   </section>
-  <section class="cards">
+  <section class="cards" id="paper-metrics" data-app-tab="paper">
     <article class="metric"><span>Illustrative capital</span><strong id="capital">₹100,000</strong><small>Configured starting capital</small></article>
     <article class="metric"><span>Daily P&amp;L (realised + open)</span><strong id="pnl">₹0.00</strong><small>Current Asia/Kolkata date</small></article>
     <article class="metric"><span>Realised today</span><strong id="realised-pnl">₹0.00</strong><small>Closed trades only</small></article>
@@ -71,7 +75,7 @@
     <article class="metric"><span>Open positions</span><strong id="positions-count">0</strong><small>Simulated positions only</small></article>
     <article class="metric"><span>Max daily loss</span><strong id="loss-limit">₹2,000</strong><small>Entry gate threshold</small></article>
   </section>
-  <section class="grid">
+  <section class="grid" id="paper-controls" data-app-tab="paper">
     <article class="panel">
       <div class="panel-heading"><div><h2>Risk controls</h2><p class="muted">Risk engine gates every simulated entry.</p></div><span id="risk-badge" class="pill">Loading</span></div>
       <div class="risk-list">
@@ -102,9 +106,9 @@
       </form>
     </article>
   </section>
-  <section class="panel" id="provider-panel">
+  <section class="panel" id="provider-panel" data-app-tab="groww" hidden>
     <div class="panel-heading">
-      <div><h2>Market Data Provider</h2>
+      <div><h2>Connection &amp; Account</h2>
         <p class="muted">Paper trades are simulated and never sent to a broker. Credentials are held in backend memory only and are never saved or shown again.</p></div>
       <span id="provider-status" class="pill">Not configured</span>
     </div>
@@ -121,7 +125,7 @@
       <p id="provider-message" role="status" class="muted"></p>
     </form>
   </section>
-  <section class="panel" id="account-insights-panel">
+  <section class="panel" id="account-insights-panel" data-app-tab="groww" hidden>
     <div class="panel-heading">
       <div><h2>Groww account insights</h2>
         <p class="muted">Connection: <strong id="account-connection-state">Not configured</strong>. Read-only Groww account data; separate from simulated AOTS paper trades and risk P&amp;L.</p></div>
@@ -143,7 +147,43 @@
     <h3>Groww holdings</h3>
     <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Quantity</th><th>Average price (₹)</th><th>Pledged quantity</th><th>T1 quantity</th></tr></thead><tbody id="groww-holdings"><tr><td colspan="5" class="muted">Not refreshed</td></tr></tbody></table></div>
   </section>
-  <section class="panel">
+  <section class="panel" id="historical-capability-panel" data-app-tab="groww" hidden>
+    <div class="panel-heading">
+      <div><h2>Historical Simulation capability check</h2>
+        <p class="muted">Manually test Groww's documented NIFTY historical expiry, contract, and FNO candle endpoints. This diagnostic only reads provider data; it creates no historical trades, changes no paper ledger/risk state, and does not use Yahoo or Groww order APIs.</p></div>
+      <span id="historical-check-status" class="pill">Not checked</span>
+    </div>
+    <p class="muted">Historical FNO data is documented from 2020. Use one expiry month and at most one day of candles; only the documented 5-minute and 15-minute examples are enabled here. Enter exchange-local wall-clock times without an offset. Groww's candle timestamps do not include a timezone, so AOTS cannot verify their timezone or session completeness.</p>
+    <form id="historical-expiry-form">
+      <div class="form-row">
+        <label>Expiry year<input name="year" type="number" min="2020" max="2100" value="2024" required></label>
+        <label>Expiry month<select name="month" required></select></label>
+      </div>
+      <button type="submit" id="historical-expiry-load">Load expiries</button>
+    </form>
+    <div class="form-row">
+      <label>Available NIFTY expiry<select id="historical-expiry" required disabled><option value="">Load expiries first</option></select></label>
+      <button type="button" id="historical-contracts-load" disabled>Load contracts</button>
+    </div>
+    <label>Available option contract<select id="historical-contract" required disabled><option value="">Load contracts first</option></select></label>
+    <form id="historical-candles-form">
+      <div class="form-row">
+        <label>Start time<input name="start_time" type="datetime-local" step="60" required></label>
+        <label>End time<input name="end_time" type="datetime-local" step="60" required></label>
+      </div>
+      <label>Candle interval<select name="candle_interval"><option value="5minute">5 minutes</option><option value="15minute">15 minutes</option></select></label>
+      <button type="submit" id="historical-candles-check" disabled>Test historical candle access</button>
+    </form>
+    <p id="historical-check-message" role="status" class="muted">No historical requests are made until you select a control above.</p>
+    <div id="historical-check-result" class="historical-result" hidden>
+      <div><span>Returned candles</span><strong id="historical-candle-count">—</strong></div>
+      <div><span>First timestamp</span><strong id="historical-first-timestamp">—</strong></div>
+      <div><span>Last timestamp</span><strong id="historical-last-timestamp">—</strong></div>
+      <div><span>Invalid OHLC/OI rows</span><strong id="historical-invalid-count">—</strong></div>
+      <p id="historical-quality-warnings" class="muted"></p>
+    </div>
+  </section>
+  <section class="panel" id="strategy-demo" data-app-tab="paper">
     <div class="panel-heading">
       <div><h2>Deterministic strategy demonstration</h2>
         <p class="muted">Supplied test inputs only; no live market feed. Evaluation is pure. Processing explicitly attempts a risk-gated paper entry.</p>
@@ -180,11 +220,11 @@
     <h3>Recent persisted strategy decisions</h3>
     <div class="table-wrap"><table><thead><tr><th>Evaluated (UTC)</th><th>Observation</th><th>Status</th><th>Reason</th><th>Candidate / trade</th></tr></thead><tbody id="strategy-decisions"><tr><td colspan="5">Loading decisions…</td></tr></tbody></table></div>
   </section>
-  <section class="panel">
+  <section class="panel" id="paper-ledger" data-app-tab="paper">
     <div class="panel-heading"><div><h2>Paper positions &amp; trade ledger</h2><p class="muted">Update marks or close trades to exercise risk controls.</p></div></div>
     <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Position side</th><th>Option type</th><th>Status</th><th>Entry premium</th><th>Stop premium</th><th>Total profit target (₹)</th><th>Last accepted manual mark / exit</th><th>Total quantity</th><th>Lots</th><th>P&amp;L type / amount</th><th>Entered (IST)</th><th>Closed (IST)</th><th>Closure reason</th><th>Actions</th></tr></thead><tbody id="trades-body"><tr><td colspan="15">Loading trades…</td></tr></tbody></table></div>
   </section>
-  <section class="panel">
+  <section class="panel" id="system-boundary" data-app-tab="paper">
     <div class="panel-heading"><div><h2>System boundary</h2><p class="muted">The current app is deliberately not connected to a broker.</p></div></div>
     <div class="boundary">
       <div><span class="boundary-icon">01</span><strong>Strategy</strong><p>Pluggable interface; safe no-op default.</p></div>
