@@ -11,7 +11,7 @@
 - `aots.brokers.base`: read-only broker contract
 - `aots.brokers.groww`: placeholder read-only adapter boundary
 - `aots.database`: SQLite persistence for trades, app state and audit events
-- `aots.backtest`: isolated yfinance acquisition/cache, OHLC quality gate, deterministic underlying-only ORB simulation, and research reports; not imported by the paper-trading runtime
+- `aots.backtest`: yfinance acquisition/cache, OHLC quality gate, shared chronological underlying-only ORB executor, in-memory replay service, and research reports; replay remains separate from paper trading
 
 ## P&L semantics
 
@@ -36,6 +36,14 @@ Market-data age is supplied by the caller and is not independently verified: the
 `SpotThresholdStrategy` implements the existing `Strategy.evaluate(MarketSnapshot)` contract. Its sole rule is to signal when supplied spot is at or above configured `AOTS_STRATEGY_SPOT_THRESHOLD`. `StrategyService.evaluate` is side-effect free. The explicit process route persists a structured outcome, reuses `RiskEngine.validate_entry`, and conditionally creates a paper trade. Input observation timestamps must include a timezone and pass the configured maximum-age check; caller-supplied timestamps and prices remain unverified.
 
 The additive `strategy_decisions` table is keyed by `(strategy_id, observation_id)` and stores a canonical input/configuration fingerprint and the complete outcome. `BEGIN IMMEDIATE` serializes lookup, fingerprint comparison, risk validation, trade insertion, audit events and decision insertion. Identical retries return the original outcome; a changed payload for the same observation conflicts. These records are strategy-decision history only and do not duplicate trade or risk state.
+
+## Historical ORB replay
+
+`POST /api/replay/start` runs the same `BacktestRunner` used by `run_backtest`, after the existing acquisition, cache-integrity, and OHLC/session validation pipeline passes. The worker advances one validated bar at a time; the runner computes indicators from bars already seen and resolves next-open entries only when the next bar is supplied. The existing ORB transition, exit, stop/target, time-exit, and index-point accounting rules are shared rather than reimplemented for replay.
+
+Replay sessions, bounded event histories, progress, and results are held only in the current process. The service allows at most three concurrent sessions, retains up to 20 sessions, and keeps up to 500 events per session. Status and event polling do not block bar execution; processing runs in a worker thread. Stop takes effect at the next bar-processing boundary; pause/resume and persistence across server restarts are not implemented.
+
+Replay results are research-only NIFTY index points under the batch engine's zero-cost assumptions. While a replay position is open, its unrealized points are marked to the most recently processed candle close. They are not option P&L or rupee capital results. The replay service does not use the paper broker, `RiskEngine`, SQLite trade/event ledger, Groww provider, or Groww account balance. The UI displays replay outputs in a dedicated section and keeps them separate from paper trades and account insights. Historical Yahoo candle-label convention remains an unverified assumption as documented in the backtest section.
 
 ## API security
 

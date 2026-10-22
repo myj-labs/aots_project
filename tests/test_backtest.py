@@ -22,6 +22,7 @@ from aots.backtest.data import (
     validate_or_raise,
 )
 from aots.backtest.engine import (
+    BacktestRunner,
     UnsupportedFilterError,
     _atr_values,
     _breakout_events,
@@ -788,6 +789,48 @@ def test_ema_and_atr_values_do_not_depend_on_future_bars():
 
     assert _ema_values(extended)[:len(bars)] == _ema_values(bars)
     assert _atr_values(extended)[:len(bars)] == _atr_values(bars)
+
+
+def test_incremental_runner_waits_for_next_open_and_matches_batch_results(tmp_path):
+    config, data = validated(make_session(), tmp_path)
+    runner = BacktestRunner(data.quality, config)
+    emitted = []
+
+    for bar in data.bars[:7]:
+        emitted.extend(runner.process_bar(bar))
+    assert emitted == []
+
+    emitted.extend(runner.process_bar(data.bars[7]))
+    assert [event["type"] for event in emitted] == ["signal", "entry"]
+    assert emitted[0]["signal"]["accepted"] is True
+    assert emitted[0]["signal"]["entry_timestamp"].endswith("09:50:00+05:30")
+    assert emitted[1]["timestamp"].endswith("09:50:00+05:30")
+    assert runner.open_position["direction"] == "LONG"
+    assert runner.open_position["unrealized_points"] == pytest.approx(0.5)
+
+    for bar in data.bars[8:]:
+        emitted.extend(runner.process_bar(bar))
+    incremental = runner.finish()
+    batch = run_backtest(data, config)
+
+    assert incremental.signals == batch.signals
+    assert incremental.trades == batch.trades
+    assert incremental.metrics == batch.metrics
+    assert [event["type"] for event in emitted] == ["signal", "entry", "exit"]
+
+
+def test_incremental_prefix_cannot_use_a_future_entry_candle(tmp_path):
+    config, data = validated(make_session(), tmp_path)
+    prefix = BacktestRunner(data.quality, config)
+    for bar in data.bars[:7]:
+        assert prefix.process_bar(bar) == []
+
+    partial = prefix.finish()
+
+    assert len(partial.signals) == 1
+    assert partial.signals[0].accepted is False
+    assert partial.signals[0].entry_timestamp is None
+    assert "no next candle" in partial.signals[0].reason
 
 
 def test_short_breakout_and_gap_through_stop(tmp_path):

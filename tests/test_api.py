@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -641,6 +641,106 @@ def test_dashboard_serves_trade_controls_and_sequence_aware_script(paper_api):
     assert 't.close_reason==="SIMULATED_TAKE_PROFIT"' in script.text
     assert 'const target = data.take_profit_profit_inr.trim();' in script.text
     assert 'api("/api/paper/mark"' in script.text
+
+
+def test_dashboard_has_separate_historical_replay_controls(paper_api):
+    client, _, _, _ = paper_api
+    page = client.get("/")
+    script = client.get("/static/app.js")
+
+    assert 'id="historical-replay"' in page.text
+    assert 'id="replay-start"' in page.text
+    assert 'id="replay-stop"' in page.text
+    assert "Gross underlying points" in page.text
+    assert "does not place broker orders" in page.text
+    assert 'api("/api/replay/start"' in script.text
+    assert "replayRenderedTrades" in script.text
+
+
+def test_historical_replay_api_returns_results_without_touching_paper_ledger(
+    paper_api,
+):
+    from aots.backtest.data import Bar, KOLKATA, ValidatedData
+
+    client, _, db, risk = paper_api
+    session_date = date(2026, 10, 20)
+    start = datetime.combine(session_date, time(9, 15), tzinfo=KOLKATA)
+    bars = []
+    for index in range(75):
+        stamp = start + timedelta(minutes=index * 5)
+        values = (100.0, 101.0, 99.0, 100.0)
+        if index == 6:
+            values = (100.5, 102.5, 100.0, 102.0)
+        elif index == 7:
+            values = (101.5, 102.5, 100.5, 102.0)
+        elif index == 8:
+            values = (102.0, 107.0, 101.0, 106.0)
+        bars.append(Bar(stamp, *values))
+    data = ValidatedData(
+        bars=bars,
+        metadata={},
+        quality={
+            "passed": True,
+            "observed_session_count": 1,
+            "rejected_sessions": [],
+        },
+    )
+    api.replay_service._loader = lambda *_args, **_kwargs: data
+    before = (db.trades(), db.events(100), risk.snapshot())
+
+    started = client.post(
+        "/api/replay/start",
+        json={
+            "start": "2026-10-20",
+            "end": "2026-10-21",
+            "offline": True,
+        },
+    )
+    assert started.status_code == 200
+    session_id = started.json()["session_id"]
+    worker = api.replay_service._get(session_id).worker
+    assert worker is not None
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+    status = client.get(f"/api/replay/{session_id}")
+    results = client.get(f"/api/replay/{session_id}/results")
+    event_batch = client.get(f"/api/replay/{session_id}/events")
+    after = (db.trades(), db.events(100), risk.snapshot())
+
+    assert status.status_code == 200
+    assert status.json()["status"] == "completed"
+    assert status.json()["data_quality"]["passed"] is True
+    assert results.json()["metrics"]["gross_underlying_points"] == 5.0
+    assert len(results.json()["trades"]) == 1
+    assert [event["type"] for event in event_batch.json()["events"]] == [
+        "signal", "entry", "exit"
+    ]
+    assert after == before
+
+
+def test_historical_replay_api_rejects_invalid_cache_policy_and_window(paper_api):
+    client, _, _, _ = paper_api
+    stale_online = client.post(
+        "/api/replay/start",
+        json={
+            "start": "2026-10-20",
+            "end": "2026-10-21",
+            "allow_stale_cache": True,
+        },
+    )
+    long_window = client.post(
+        "/api/replay/start",
+        json={
+            "start": "2026-08-01",
+            "end": "2026-10-21",
+        },
+    )
+
+    assert stale_online.status_code == 422
+    assert "requires offline mode" in str(stale_online.json()["detail"])
+    assert long_window.status_code == 422
+    assert "60-calendar-day" in str(long_window.json()["detail"])
 
 
 def test_core_endpoints_stay_healthy_when_strategy_history_fails(paper_api, monkeypatch):
