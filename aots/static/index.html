@@ -25,6 +25,8 @@
   <nav class="app-tabs" aria-label="Application sections">
     <button type="button" class="app-tab" data-tab="paper" aria-pressed="true">Paper Trading</button>
     <button type="button" class="app-tab" data-tab="groww" aria-pressed="false">Groww</button>
+    <button type="button" class="app-tab" data-tab="backtest" aria-pressed="false">Backtesting</button>
+    <button type="button" class="app-tab" data-tab="log" aria-pressed="false">Groww log</button>
   </nav>
   <section class="panel replay-panel" id="historical-replay" data-app-tab="paper">
     <div class="panel-heading">
@@ -109,16 +111,17 @@
   <section class="panel" id="provider-panel" data-app-tab="groww" hidden>
     <div class="panel-heading">
       <div><h2>Connection &amp; Account</h2>
-        <p class="muted">Paper trades are simulated and never sent to a broker. Credentials are held in backend memory only and are never saved or shown again.</p></div>
+        <p class="muted">Paper trades are simulated and never sent to a broker. Credentials are held in backend memory only and are never saved or shown again. A supplied access token is validated by Groww on the first provider request.</p></div>
       <span id="provider-status" class="pill">Not configured</span>
     </div>
     <form id="provider-form" autocomplete="off">
       <div class="form-row">
         <label>Provider<select name="provider" id="provider-select"><option value="groww" selected>Groww</option><option value="kite" disabled>Zerodha Kite (Coming soon)</option></select></label>
-        <label>Authentication method<select name="auth_method" id="provider-auth-method"><option value="totp" selected>API key + TOTP secret</option><option value="approval">API key + API secret (daily approval)</option></select></label>
+        <label>Authentication method<select name="auth_method" id="provider-auth-method"><option value="totp" selected>API key + TOTP secret</option><option value="approval">API key + API secret (daily approval)</option><option value="access_token">Existing access token</option></select></label>
         <label>API key<input name="api_key" type="password" autocomplete="off" spellcheck="false"></label>
         <label data-auth="totp">TOTP secret<input name="totp_secret" type="password" autocomplete="off" spellcheck="false"></label>
         <label data-auth="approval" hidden>API secret<input name="api_secret" type="password" autocomplete="off" spellcheck="false"></label>
+        <label data-auth="access_token" hidden>Access token<input name="access_token" type="password" autocomplete="off" spellcheck="false"></label>
       </div>
       <button type="submit" id="provider-connect">Connect</button>
       <button type="button" id="provider-disconnect">Disconnect</button>
@@ -182,6 +185,66 @@
       <div><span>Invalid OHLC/OI rows</span><strong id="historical-invalid-count">—</strong></div>
       <p id="historical-quality-warnings" class="muted"></p>
     </div>
+  </section>
+  <section class="panel" id="response-log-panel" data-app-tab="log" hidden>
+    <div class="panel-heading"><div><h2>Groww historical response log</h2>
+      <p class="muted">Raw JSON of Groww historical market-data responses (expiries, contracts, candles), newest first, kept in memory only and long lists shortened. Credentials, tokens, account data and orders are never logged.</p></div>
+      <span id="rl-status" class="pill">Not loaded</span></div>
+    <div class="actions"><button type="button" id="rl-refresh">Refresh</button> <button type="button" id="rl-clear">Clear log</button></div>
+    <div id="rl-entries" class="muted">No responses loaded.</div>
+  </section>
+  <section class="panel" id="options-backtest-panel" data-app-tab="backtest" hidden>
+    <div class="panel-heading">
+      <div><h2>Historical NIFTY options ORB backtest</h2>
+        <p class="muted">Read-only research simulation. NIFTY index candles from Groww give the opening-range signal; fills use real Groww option premium candles. No order is ever sent, and the paper ledger, risk state, account balance and Yahoo replay are not touched. Connect Groww on the Groww tab first. Results from mocked tests do not validate real Groww data.</p></div>
+      <span id="ob-status" class="pill">No run</span>
+    </div>
+    <form id="ob-form">
+      <div class="form-row">
+        <label>Start date<input name="start_date" type="date" required></label>
+        <label>End date (before today, max 31 days)<input name="end_date" type="date" required></label>
+      </div>
+      <div class="form-row">
+        <label>Decision candle interval<select name="candle_interval"><option value="1minute">1 minute</option><option value="5minute" selected>5 minutes</option><option value="10minute">10 minutes</option></select></label>
+        <label>Option side<select name="option_side_mode"><option value="both">CE and PE</option><option value="ce_only">CE only</option><option value="pe_only">PE only</option></select></label>
+        <label>Opening range (minutes)<input name="opening_range_minutes" type="number" min="15" max="60" step="5" value="60"></label>
+        <label>Entry cutoff<input name="entry_cutoff" type="time" value="15:00"></label>
+        <label>Square-off<input name="square_off_time" type="time" value="15:15"></label>
+      </div>
+      <div class="form-row">
+        <label>Strike offset (steps OTM)<input name="strike_offset_steps" type="number" min="0" max="5" value="0"></label>
+        <label>Min days to expiry<input name="min_days_to_expiry" type="number" min="0" max="7" value="0"></label>
+        <label>Stop/target mode<select name="exit_level_mode"><option value="percentage" selected>Percentage of entry premium</option><option value="premium_points">Fixed premium points (₹)</option></select></label>
+        <label data-ob-exit-mode="percentage">Stop loss (%)<input name="stop_loss_pct" type="number" min="0.01" max="99" step="any" value="25"></label>
+        <label data-ob-exit-mode="percentage">Target (%)<input name="target_pct" type="number" min="0.01" max="1000" step="any" value="50"></label>
+        <label data-ob-exit-mode="premium_points" hidden>Stop loss (₹ below entry)<input name="stop_loss_points" type="number" min="0.01" max="100000" step="any" value="5"></label>
+        <label data-ob-exit-mode="premium_points" hidden>Sell trigger (₹ above entry)<input name="target_points" type="number" min="0.01" max="100000" step="any" value="5"></label>
+        <label>Max trades/session<input name="max_trades_per_session" type="number" min="1" step="1" value="1"></label>
+      </div>
+      <div class="form-row">
+        <label>Lots<input name="lots" type="number" min="1" value="1"></label>
+        <label>Lot size (you supply; unverified)<input name="lot_size" type="number" min="1" required></label>
+        <label>Simulated capital (₹)<input name="initial_capital_inr" type="number" min="1" step="any" value="100000"></label>
+      </div>
+      <div class="form-row">
+        <label>Brokerage per order (₹)<input name="brokerage_per_order_inr" type="number" min="0" step="any" value="0"></label>
+        <label>STT on sell (%)<input name="stt_sell_pct" type="number" min="0" step="any" value="0"></label>
+        <label>Exchange charges (%)<input name="exchange_txn_pct" type="number" min="0" step="any" value="0"></label>
+        <label>Stamp duty on buy (%)<input name="stamp_duty_buy_pct" type="number" min="0" step="any" value="0"></label>
+        <label>GST (%)<input name="gst_pct" type="number" min="0" step="any" value="0"></label>
+        <label>Slippage per unit per side (₹)<input name="slippage_per_unit_inr" type="number" min="0" step="any" value="0"></label>
+      </div>
+      <button type="submit" id="ob-start">Run backtest</button>
+      <button type="button" id="ob-stop" disabled>Stop</button>
+    </form>
+    <p id="ob-message" role="status" class="muted">No backtest has been started.</p>
+    <div id="ob-summary" class="historical-result" hidden></div>
+    <div id="ob-notes" class="muted"></div>
+    <div class="table-wrap"><table><thead><tr><th>Date</th><th>Contract</th><th>Type</th><th>Strike</th><th>Expiry</th><th>Entry</th><th>Entry ₹</th><th>Exit</th><th>Exit ₹</th><th>Max premium</th><th>Lots×size=qty</th><th>Gross</th><th>Charges</th><th>Slippage</th><th>Net</th><th>Exit reason</th><th>Warnings</th></tr></thead><tbody id="ob-trades"><tr><td colspan="17" class="muted">No trades</td></tr></tbody></table></div>
+    <h3>Session diagnostics</h3>
+    <div class="table-wrap"><table><thead><tr><th>Date</th><th>Status</th><th>Reason / warnings</th><th>Signals</th><th>Trades</th></tr></thead><tbody id="ob-sessions"><tr><td colspan="5" class="muted">No sessions</td></tr></tbody></table></div>
+    <h3>Rules and limitations</h3>
+    <ul id="ob-rules" class="muted"></ul>
   </section>
   <section class="panel" id="strategy-demo" data-app-tab="paper">
     <div class="panel-heading">

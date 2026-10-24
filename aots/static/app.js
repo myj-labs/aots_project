@@ -692,3 +692,176 @@ async function restoreReplaySession() {
   }
 }
 restoreReplaySession();
+
+/* ---------- Historical options backtest (read-only Groww data) ---------- */
+let obRunId = null;
+let obTimer = null;
+const OB_LABELS = {running:"Running", completed:"Completed", stopped:"Stopped (partial)", failed:"Failed", idle:"No run"};
+const OB_ERROR_LABELS = {
+  provider_auth:"Authentication failed", provider_denied:"Access denied", provider_not_connected:"Not connected",
+  configuration:"Invalid configuration", provider_rate_limited:"Rate limited", provider_response:"Malformed provider response",
+  provider_unavailable:"Provider unavailable", execution_error:"Execution error"
+};
+function obStatus(label, state, message) {
+  $("ob-status").textContent = label;
+  $("ob-status").dataset.state = state;
+  if(message !== undefined) $("ob-message").textContent = message;
+}
+function obRow(cells) {
+  return `<tr>${cells.map(c => `<td>${escapeHtml(c ?? "—")}</td>`).join("")}</tr>`;
+}
+function obTime(iso) { return iso ? String(iso).replace("T", " ") : "—"; }
+function obBody(form) {
+  const f = new FormData(form);
+  const num = (k) => Number(f.get(k));
+  const t = (k) => String(f.get(k)).length === 5 ? `${f.get(k)}:00` : String(f.get(k));
+  return {
+    start_date: f.get("start_date"), end_date: f.get("end_date"),
+    candle_interval: f.get("candle_interval"),
+    option_side_mode: f.get("option_side_mode"),
+    exit_level_mode: f.get("exit_level_mode"),
+    opening_range_minutes: num("opening_range_minutes"),
+    entry_cutoff: t("entry_cutoff"), square_off_time: t("square_off_time"),
+    strike_offset_steps: num("strike_offset_steps"), min_days_to_expiry: num("min_days_to_expiry"),
+    stop_loss_pct: num("stop_loss_pct"), target_pct: num("target_pct"),
+    stop_loss_points: num("stop_loss_points"), target_points: num("target_points"),
+    max_trades_per_session: num("max_trades_per_session"),
+    lots: num("lots"), lot_size: num("lot_size"), initial_capital_inr: num("initial_capital_inr"),
+    costs: {
+      brokerage_per_order_inr: num("brokerage_per_order_inr"), stt_sell_pct: num("stt_sell_pct"),
+      exchange_txn_pct: num("exchange_txn_pct"), stamp_duty_buy_pct: num("stamp_duty_buy_pct"),
+      gst_pct: num("gst_pct"), slippage_per_unit_inr: num("slippage_per_unit_inr")
+    }
+  };
+}
+function obSyncExitMode() {
+  const mode = $("ob-form").elements.exit_level_mode.value;
+  document.querySelectorAll("[data-ob-exit-mode]").forEach(label => {
+    label.hidden = label.dataset.obExitMode !== mode;
+  });
+}
+function obRenderResult(run) {
+  const result = run.result;
+  if(!result) return;
+  const s = result.summary;
+  const kinds = {
+    trades: "Trades simulated.",
+    zero_trades: "Zero trades: sessions were processed but no entry rule produced a trade. This is not a failure.",
+    no_historical_data: "No historical data was returned for any requested session.",
+    invalid_or_incomplete_data: "Data was invalid or incomplete for every session; no results can be relied on."
+  };
+  const cards = [
+    ["Sessions processed / requested", `${s.sessions_processed} / ${s.sessions_requested}`],
+    ["Excluded sessions", `${s.sessions_excluded} ${Object.keys(s.excluded_reasons).length ? "(" + Object.entries(s.excluded_reasons).map(([k,v]) => `${k}: ${v}`).join(", ") + ")" : ""}`],
+    ["Trades", `${s.trade_count} (win rate ${s.win_rate_pct === null ? "n/a" : s.win_rate_pct + "%"})`],
+    ["Gross P&L", inr(s.gross_pnl)], ["Total costs", `${inr(s.total_costs)} (charges ${inr(s.total_charges)}, slippage ${inr(s.total_slippage)})`],
+    ["Net P&L", inr(s.net_pnl)], ["Max drawdown", `${inr(s.max_drawdown_inr)} (${s.max_drawdown_pct}%)`],
+    ["Profit factor", s.profit_factor === null ? "n/a" : String(s.profit_factor)],
+    ["Avg net / trade", s.average_trade_pnl === null ? "n/a" : inr(s.average_trade_pnl)],
+    ["Simulated equity", `${inr(s.initial_equity)} → ${inr(s.ending_equity)}`]
+  ];
+  $("ob-summary").hidden = false;
+  $("ob-summary").innerHTML = cards.map(([k, v]) => `<div><span>${escapeHtml(k)}</span><strong>${escapeHtml(v)}</strong></div>`).join("");
+  const notes = [kinds[s.result_kind] || "", s.net_pnl_basis, s.profit_factor_note, s.max_drawdown_method];
+  if(s.results_may_be_incomplete) notes.push("Some sessions or signals were excluded for data reasons; results may be biased or incomplete.");
+  if(!s.costs_configured) notes.push("No costs configured: net P&L is not cost-modelled.");
+  $("ob-notes").innerHTML = notes.filter(Boolean).map(n => `<p>${escapeHtml(n)}</p>`).join("");
+  $("ob-trades").innerHTML = result.trades.length ? result.trades.map(t => obRow([
+    t.session_date, t.contract.groww_symbol, t.contract.option_type, t.contract.strike, t.contract.expiry,
+    obTime(t.entry_time), t.entry_premium, obTime(t.exit_time), t.exit_premium,
+    `${t.max_premium_reached} @ ${obTime(t.max_premium_time)}`,
+    `${t.lots}×${t.lot_size}=${t.quantity}`, inr(t.gross_pnl), inr(t.costs.charges_total), inr(t.costs.slippage), inr(t.net_pnl),
+    t.exit_reason, t.warnings.join(" | ")
+  ])).join("") : `<tr><td colspan="17" class="muted">No trades</td></tr>`;
+  $("ob-sessions").innerHTML = result.sessions.length ? result.sessions.map(x => {
+    const skipped = result.skipped_signals.filter(k => k.session_date === x.session_date).map(k => `${k.reason}`);
+    return obRow([x.session_date, x.status, [x.reason, ...x.warnings, ...skipped].filter(Boolean).join(" | "), x.signals.length, x.trades.length]);
+  }).join("") : `<tr><td colspan="5" class="muted">No sessions</td></tr>`;
+  $("ob-rules").innerHTML = [...result.rules, ...result.limitations, result.data_source.timestamp_note]
+    .map(r => `<li>${escapeHtml(r)}</li>`).join("");
+}
+function obApply(run) {
+  const running = run.state === "running";
+  $("ob-start").disabled = running;
+  $("ob-stop").disabled = !running;
+  if(running) {
+    const p = run.progress;
+    obStatus(OB_LABELS.running, "running", `Processed ${p.done} of ${p.total} sessions${p.current_date ? " (now " + p.current_date + ")" : ""}.`);
+    return;
+  }
+  if(run.state === "failed") {
+    const e = run.error || {};
+    obStatus(OB_ERROR_LABELS[e.category] || "Failed", "failed", `Backtest failed: ${e.message || "unknown error"}. This is not a zero-trade result.`);
+    return;
+  }
+  const kind = run.result && run.result.summary.result_kind;
+  const label = run.state === "stopped" ? OB_LABELS.stopped : (kind === "zero_trades" ? "Zero trades" : kind === "no_historical_data" ? "No data" : kind === "invalid_or_incomplete_data" ? "Invalid data" : OB_LABELS.completed);
+  obStatus(label, run.state === "stopped" ? "incomplete" : (kind === "trades" ? "ok" : "incomplete"), run.state === "stopped" ? "Stopped; results cover only the sessions processed so far." : "Backtest finished.");
+  obRenderResult(run);
+}
+async function obPoll() {
+  if(!obRunId) return;
+  try {
+    const run = await api(`/api/options-backtest/runs/${encodeURIComponent(obRunId)}`);
+    obApply(run);
+    if(run.state === "running") obTimer = setTimeout(obPoll, 2000);
+  } catch(err) {
+    $("ob-start").disabled = false; $("ob-stop").disabled = true;
+    obStatus("Failed", "failed", `Could not read run status: ${err.message}`);
+  }
+}
+$("ob-form").elements.exit_level_mode.addEventListener("change", obSyncExitMode);
+obSyncExitMode();
+$("ob-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  clearTimeout(obTimer);
+  $("ob-summary").hidden = true; $("ob-notes").textContent = "";
+  $("ob-trades").innerHTML = `<tr><td colspan="17" class="muted">No trades</td></tr>`;
+  $("ob-sessions").innerHTML = `<tr><td colspan="5" class="muted">No sessions</td></tr>`;
+  $("ob-rules").innerHTML = "";
+  $("ob-start").disabled = true;
+  obStatus("Starting", "running", "Starting backtest…");
+  try {
+    const run = await api("/api/options-backtest/runs", {method:"POST", body: JSON.stringify(obBody(event.target))});
+    obRunId = run.run_id;
+    obApply(run);
+    obTimer = setTimeout(obPoll, 1000);
+  } catch(err) {
+    $("ob-start").disabled = false;
+    const label = err.status === 409 ? "Not connected" : err.status === 422 ? "Invalid configuration" : "Failed";
+    obStatus(label, "failed", err.message);
+  }
+});
+$("ob-stop").addEventListener("click", async () => {
+  if(!obRunId) return;
+  $("ob-stop").disabled = true;
+  try { await api(`/api/options-backtest/runs/${encodeURIComponent(obRunId)}/stop`, {method:"POST"}); }
+  catch(err) { obStatus("Failed", "failed", err.message); }
+});
+
+// Groww historical response log (diagnostic).
+async function rlRefresh() {
+  const box = $("rl-entries");
+  try {
+    const data = await api("/api/provider/response-log");
+    $("rl-status").textContent = `${data.entries.length} response(s)`;
+    if(!data.entries.length) { box.textContent = "No Groww historical responses recorded yet."; return; }
+    box.innerHTML = data.entries.map(e => {
+      const query = Object.entries(e.query).map(([k, v]) => `${k}=${v}`).join("&");
+      const head = `#${e.id} ? ${e.received_at} ? HTTP ${e.http_status} ? ${e.path}`;
+      return `<details><summary>${escapeHtml(head)}</summary>`
+        + `<p class="muted">${escapeHtml(query)}</p>`
+        + `<p class="muted">Structure: ${escapeHtml(JSON.stringify(e.structure))}</p>`
+        + `<pre>${escapeHtml(JSON.stringify(e.body, null, 2))}</pre></details>`;
+    }).join("");
+  } catch(err) {
+    $("rl-status").textContent = "Failed";
+    box.textContent = err.message;
+  }
+}
+$("rl-refresh").addEventListener("click", rlRefresh);
+$("rl-clear").addEventListener("click", async () => {
+  await api("/api/provider/response-log/clear", {method: "POST"}).catch(() => null);
+  rlRefresh();
+});
+document.querySelectorAll('.app-tab[data-tab="log"]').forEach(b => b.addEventListener("click", rlRefresh));

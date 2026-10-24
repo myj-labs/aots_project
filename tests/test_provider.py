@@ -22,6 +22,7 @@ from test_api import _STATIC_DIR, _run_harness_page, needs_browser
 MARKER = "FAKE-SECRET-MARKER-7f3a9c"
 TOTP = {"provider": "groww", "auth_method": "totp", "api_key": MARKER + "-key", "totp_secret": MARKER + "-totp"}
 APPROVAL = {"provider": "groww", "auth_method": "approval", "api_key": MARKER + "-key", "api_secret": MARKER + "-sec"}
+ACCESS_TOKEN = {"provider": "groww", "auth_method": "access_token", "access_token": MARKER + "-access-token"}
 
 
 class FakeConnection:
@@ -221,6 +222,68 @@ def test_token_response_with_inactive_flag_is_rejected(provider_env):
     assert body["state"] == "failed"
     assert body["connected"] is False
     assert body["configured"] is False
+
+
+def test_existing_access_token_connects_in_memory_and_authenticates_provider_request(provider_env):
+    token = ACCESS_TOKEN["access_token"]
+    now = datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)
+    mgr, created, transports = groww_manager_with_transport(
+        [now],
+        responses=[(200, {"status": "SUCCESS", "payload": {"expiries": ["2025-01-09"]}})],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        connected = client.post("/api/provider/connect", json=ACCESS_TOKEN)
+        assert connected.status_code == 200
+        assert connected.json()["state"] == "connected"
+        assert connected.json()["auth_method"] == "access_token"
+        assert token not in connected.text
+
+        expiries = client.get("/api/provider/historical/expiries?year=2025&month=1")
+        assert expiries.status_code == 200
+        assert expiries.json() == {"expiries": ["2025-01-09"]}
+        assert created[0]._credentials is None and created[0]._token == token
+
+    assert len(transports) == 1
+    assert len(transports[0].calls) == 1
+    method, url, headers, body = transports[0].calls[0]
+    assert method == "GET" and url.split("?", 1)[0].endswith("/v1/historical/expiries")
+    assert headers["Authorization"] == f"Bearer {token}"
+    assert body is None
+    assert token not in persisted_text(provider_env)
+    assert token not in json.dumps(mgr.status())
+
+
+def test_invalid_existing_access_token_is_rejected_without_echoing_it(provider_env):
+    bad_token = "short"
+    payload = {**ACCESS_TOKEN, "access_token": bad_token}
+    mgr, _, transports = groww_manager_with_transport(
+        [datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)]
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        response = client.post("/api/provider/connect", json=payload)
+        assert response.status_code == 200
+        assert response.json()["state"] == "failed"
+        assert response.json()["failure_reason"] == "The access token is invalid."
+        assert bad_token not in response.text
+    assert transports[0].calls == []
+
+
+def test_groww_rejected_existing_access_token_marks_session_failed(provider_env):
+    mgr, _, _ = groww_manager_with_transport(
+        [datetime(2025, 1, 3, 0, 0, tzinfo=timezone.utc)],
+        responses=[(401, {"error": {"code": "GA005", "message": "sensitive upstream text"}})],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        connected = client.post("/api/provider/connect", json=ACCESS_TOKEN).json()
+        assert connected["connected"] is True
+        response = client.get("/api/provider/historical/expiries?year=2025&month=1")
+        assert response.status_code == 401
+        assert "sensitive upstream text" not in response.text
+        status = client.get("/api/provider/status").json()
+        assert status["state"] == "failed" and status["connected"] is False
 
 
 def test_status_exposes_only_non_sensitive_metadata(provider_env):
@@ -702,9 +765,10 @@ def test_provider_activity_does_not_change_paper_trading(provider_env):
 def test_dashboard_has_masked_inputs_and_no_browser_storage():
     html_text = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
     js = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
-    for name in ("api_key", "totp_secret", "api_secret"):
+    for name in ("api_key", "totp_secret", "api_secret", "access_token"):
         assert f'name="{name}" type="password"' in html_text
     assert 'value="kite" disabled' in html_text
+    assert 'value="access_token">Existing access token</option>' in html_text
     for banned in ("localStorage", "sessionStorage", "indexedDB", "document.cookie"):
         assert banned not in js
 
@@ -845,7 +909,7 @@ window.fetch = async (path, options) => {{
   document.body.appendChild(pre);
 }})();
 </script>""")[0]
-    assert snapshot["afterConnect"] == ["", "", ""] and snapshot["afterDisconnect"] == ["", "", ""]
+    assert snapshot["afterConnect"] == ["", "", "", ""] and snapshot["afterDisconnect"] == ["", "", "", ""]
     assert MARKER in snapshot["connectBody"]
     assert all(MARKER not in url for url in snapshot["urls"])
     assert snapshot["storage"] == [0, 0, ""]
@@ -920,6 +984,32 @@ def test_historical_expiry_contract_and_candle_diagnostic_is_read_only(provider_
     assert all(call[1].startswith("https://api.groww.in/") for call in calls)
     assert all(call[2].get("X-API-VERSION") == "1.0" for call in calls[1:])
     assert all(call[2].get("Authorization") == "Bearer tok-12345678" for call in calls[1:])
+
+
+def test_historical_contract_list_ignores_valid_future_without_rejecting_options(provider_env):
+    now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)
+    call_symbol = "NSE-NIFTY-27Oct26-22500-CE"
+    put_symbol = "NSE-NIFTY-27Oct26-22500-PE"
+    future_symbol = "NSE-NIFTY-27Oct26-FUT"
+    mgr, _, _ = groww_manager_with_transport(
+        [now],
+        responses=[
+            (200, {"token": "tok-12345678", "isActive": True}),
+            (200, {
+                "status": "SUCCESS",
+                "payload": {"contracts": [call_symbol, future_symbol, put_symbol]},
+            }),
+        ],
+    )
+    provider_env.install(mgr)
+    with TestClient(app) as client:
+        client.post("/api/provider/connect", json=APPROVAL)
+        response = client.get("/api/provider/historical/contracts?expiry_date=2026-10-27")
+        log = client.get("/api/provider/response-log").json()
+
+    assert response.status_code == 200
+    assert response.json()["contracts"] == [call_symbol, put_symbol]
+    assert log["entries"][0]["body"]["payload"]["contracts"] == [call_symbol, future_symbol, put_symbol]
 
 
 @pytest.mark.parametrize(

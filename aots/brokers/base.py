@@ -1,4 +1,5 @@
 ﻿from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Protocol
 
 
@@ -53,6 +54,19 @@ class ProviderUnavailableError(ProviderError):
 
 class ProviderResponseError(ProviderError):
     safe_message = "Provider returned an unexpected response."
+
+
+@dataclass(frozen=True)
+class HistoricalCandle:
+    """One provider candle. ``timestamp`` is timezone-unspecified, exactly as supplied."""
+
+    timestamp: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float | None
+    open_interest: float | None = None
 
 
 @dataclass(frozen=True)
