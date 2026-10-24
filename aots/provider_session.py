@@ -30,12 +30,13 @@ AUTH_METHODS: dict[str, dict[str, tuple[str, ...]]] = {
     "groww": {
         "totp": ("api_key", "totp_secret"),
         "approval": ("api_key", "api_secret"),
+        "access_token": ("access_token",),
     },
     "kite": {},
 }
 PROVIDER_LABELS = {"groww": "Groww", "kite": "Zerodha Kite"}
 AVAILABLE_PROVIDERS = frozenset({"groww"})
-CREDENTIAL_FIELDS = ("api_key", "totp_secret", "api_secret")
+CREDENTIAL_FIELDS = ("api_key", "totp_secret", "api_secret", "access_token")
 
 
 class ProviderRequestError(Exception):
@@ -50,10 +51,11 @@ class ProviderRequestError(Exception):
 class ProviderConnectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     provider: Literal["groww", "kite"]
-    auth_method: Literal["totp", "approval"]
+    auth_method: Literal["totp", "approval", "access_token"]
     api_key: SecretStr | None = Field(default=None, max_length=2048)
     totp_secret: SecretStr | None = Field(default=None, max_length=2048)
     api_secret: SecretStr | None = Field(default=None, max_length=2048)
+    access_token: SecretStr | None = Field(default=None, max_length=4096)
 
 
 class ProviderConnection(MarketDataProvider, AccountInsightsProvider, Protocol):
@@ -75,6 +77,11 @@ class ProviderConnection(MarketDataProvider, AccountInsightsProvider, Protocol):
         self, groww_symbol, start_time, end_time, candle_interval
     ) -> dict:
         """Check access and response quality for historical option candles."""
+
+    def get_historical_candles(
+        self, segment, groww_symbol, start_time, end_time, candle_interval
+    ) -> list:
+        """Return read-only historical candles for the NIFTY index or an option."""
 
 
 ConnectionFactory = Callable[[str, Mapping[str, str]], ProviderConnection]
@@ -263,6 +270,18 @@ class ProviderSessionManager:
         try:
             return self._active_connection().check_historical_candles(
                 groww_symbol, start_time, end_time, candle_interval
+            )
+        except ValueError as exc:
+            raise ProviderRequestError(str(exc), 422)
+        except ProviderError as exc:
+            self._on_provider_error(exc)
+
+    def historical_candles(
+        self, segment, groww_symbol, start_time, end_time, candle_interval
+    ) -> list:
+        try:
+            return self._active_connection().get_historical_candles(
+                segment, groww_symbol, start_time, end_time, candle_interval
             )
         except ValueError as exc:
             raise ProviderRequestError(str(exc), 422)

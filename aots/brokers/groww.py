@@ -19,9 +19,11 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Any, Callable, Mapping, Protocol
 
 
+from .response_log import HISTORICAL_RESPONSE_LOG
 from .base import (
     AccountInsightsProvider,
     Greeks,
+    HistoricalCandle,
     IndexQuote,
     OptionChain,
     OptionQuote,
@@ -83,6 +85,7 @@ SUPPORTED_EXCHANGE = "NSE"
 _TOKEN_RE = re.compile(r"^[\x21-\x7e]{8,4096}$")
 _EXPIRY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _GROWW_OPTION_SYMBOL_RE = re.compile(r"^NSE-NIFTY-[A-Za-z0-9.-]{1,64}-(CE|PE)$")
+_GROWW_CONTRACT_LIST_SYMBOL_RE = re.compile(r"^NSE-NIFTY-[A-Za-z0-9.-]{1,64}-(CE|PE|FUT)$")
 
 
 class TransportError(Exception):
@@ -201,6 +204,27 @@ def validate_expiry(expiry: str) -> str:
     return expiry
 
 
+def _parse_candle_rows(candles: list, *, allow_missing_volume: bool = False) -> list[HistoricalCandle]:
+    rows: list[HistoricalCandle] = []
+    for candle in candles:
+        if not isinstance(candle, list) or len(candle) not in (6, 7):
+            raise ProviderResponseError()
+        timestamp = candle[0]
+        if not isinstance(timestamp, str):
+            raise ProviderResponseError()
+        try:
+            parsed_time = datetime.fromisoformat(timestamp)
+        except ValueError:
+            raise ProviderResponseError() from None
+        if parsed_time.tzinfo is not None:
+            raise ProviderResponseError()
+        prices = [_number(value) for value in candle[1:5]]
+        volume = _number(candle[5], allow_none=allow_missing_volume)
+        open_interest = _number(candle[6], allow_none=True) if len(candle) == 7 else None
+        rows.append(HistoricalCandle(parsed_time, *prices, volume, open_interest))
+    return rows
+
+
 class GrowwRuntimeConnection:
     """Runtime-only Groww session: documented token exchange plus read-only market data.
 
@@ -232,6 +256,15 @@ class GrowwRuntimeConnection:
         if creds is None or self._token is not None:
             raise ProviderResponseError("Session is not in a connectable state.")
         now = self._clock()
+        if self.auth_method == "access_token":
+            token = creds.get("access_token")
+            if not isinstance(token, str) or not _TOKEN_RE.fullmatch(token):
+                raise ProviderAuthError("The access token is invalid.")
+            self._token = token
+            self._expires_at = None
+            creds.clear()
+            self._credentials = None
+            return
         if self.auth_method == "approval":
             timestamp = str(int(now.timestamp()))
             body = {
@@ -275,13 +308,15 @@ class GrowwRuntimeConnection:
         self._token = None
         self._expires_at = None
 
-    def _send(self, method, url, headers, body=None, auth=False):
+    def _send(self, method, url, headers, body=None, auth=False, log=None):
         try:
             status, data = self._transport.request(method, url, headers, body)
         except ProviderError:
             raise
         except Exception:
             raise ProviderUnavailableError() from None
+        if log is not None:
+            HISTORICAL_RESPONSE_LOG.record(log[0], log[1], status, data)
         error = data.get("error") if isinstance(data, dict) else None
         code = error.get("code") if isinstance(error, dict) else None
         if code == "GA005":
@@ -323,7 +358,7 @@ class GrowwRuntimeConnection:
             "Accept": "application/json",
             "X-API-VERSION": API_VERSION,
         }
-        _, data = self._send("GET", url, headers)
+        _, data = self._send("GET", url, headers, log=(path, query))
         if not isinstance(data, dict) or data.get("status") != "SUCCESS":
             if isinstance(data, dict) and data.get("status") == "FAILURE":
                 raise ProviderRejectedError("Groww reported a failure for this request.")
@@ -429,14 +464,68 @@ class GrowwRuntimeConnection:
             or len(contracts) > MAX_HISTORICAL_CONTRACTS
             or any(
                 not isinstance(value, str)
-                or not _GROWW_OPTION_SYMBOL_RE.fullmatch(value)
+                or not _GROWW_CONTRACT_LIST_SYMBOL_RE.fullmatch(value)
                 for value in contracts
             )
         ):
             raise ProviderResponseError()
         if len(set(contracts)) != len(contracts):
             raise ProviderResponseError()
-        return contracts
+        # Groww can include the underlying future in an options-chain response.
+        # Keep this API options-only; the raw mixed response remains in the diagnostic log.
+        return [value for value in contracts if _GROWW_OPTION_SYMBOL_RE.fullmatch(value)]
+
+    def _validate_candle_window(self, start_time: datetime, end_time: datetime, candle_interval: str) -> None:
+        if candle_interval not in {"1minute", "5minute", "10minute", "15minute"}:
+            raise ValueError("candle_interval must be 1minute, 5minute, 10minute or 15minute.")
+        if start_time.tzinfo is not None or end_time.tzinfo is not None:
+            raise ValueError("Historical timestamps must be local exchange times without an offset.")
+        if start_time < datetime(2020, 1, 1):
+            raise ValueError("Historical data requests must start on or after 2020-01-01.")
+        if end_time <= start_time or end_time - start_time > timedelta(days=1):
+            raise ValueError("Choose an end time after the start, within a one-day request window.")
+        local_now = self._clock().astimezone(IST).replace(tzinfo=None)
+        if end_time > local_now:
+            raise ValueError("Historical candle requests cannot end in the future.")
+
+    def get_historical_candles(
+        self,
+        segment: str,
+        groww_symbol: str,
+        start_time: datetime,
+        end_time: datetime,
+        candle_interval: str,
+    ) -> list[HistoricalCandle]:
+        """Read-only candles for the NIFTY index (CASH) or a NIFTY option contract (FNO).
+
+        Rows are returned exactly as supplied (timezone-unspecified, unsorted if the
+        provider sent them unsorted); quality judgement belongs to the caller.
+        """
+        if segment == "CASH":
+            if groww_symbol != f"{SUPPORTED_EXCHANGE}-{SUPPORTED_INDEX}":
+                raise ValueError("Only the NIFTY index is supported for CASH candles.")
+        elif segment == "FNO":
+            if not _GROWW_OPTION_SYMBOL_RE.fullmatch(groww_symbol):
+                raise ValueError("Choose a NIFTY option contract returned by Groww.")
+        else:
+            raise ValueError("segment must be CASH or FNO.")
+        self._validate_candle_window(start_time, end_time, candle_interval)
+        payload = self._get(
+            "/v1/historical/candles",
+            {
+                "exchange": SUPPORTED_EXCHANGE,
+                "segment": segment,
+                "groww_symbol": groww_symbol,
+                "start_time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "end_time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "candle_interval": candle_interval,
+            },
+        )
+        candles = payload.get("candles")
+        if not isinstance(candles, list) or len(candles) > MAX_HISTORICAL_CANDLES:
+            raise ProviderResponseError()
+        # Groww documents volume for equities and F&O only, so index candles may carry null volume.
+        return _parse_candle_rows(candles, allow_missing_volume=segment == "CASH")
 
     def check_historical_candles(
         self,
@@ -447,17 +536,7 @@ class GrowwRuntimeConnection:
     ) -> dict[str, Any]:
         if not _GROWW_OPTION_SYMBOL_RE.fullmatch(groww_symbol):
             raise ValueError("Choose a NIFTY option contract returned by Groww.")
-        if candle_interval not in {"5minute", "15minute"}:
-            raise ValueError("candle_interval must be 5minute or 15minute.")
-        if start_time.tzinfo is not None or end_time.tzinfo is not None:
-            raise ValueError("Historical timestamps must be local exchange times without an offset.")
-        if start_time < datetime(2020, 1, 1):
-            raise ValueError("Historical data requests must start on or after 2020-01-01.")
-        if end_time <= start_time or end_time - start_time > timedelta(days=1):
-            raise ValueError("Choose an end time after the start, within a one-day request window.")
-        local_now = self._clock().astimezone(IST).replace(tzinfo=None)
-        if end_time > local_now:
-            raise ValueError("Historical candle requests cannot end in the future.")
+        self._validate_candle_window(start_time, end_time, candle_interval)
         payload = self._get(
             "/v1/historical/candles",
             {
@@ -473,23 +552,11 @@ class GrowwRuntimeConnection:
         if not isinstance(candles, list) or len(candles) > MAX_HISTORICAL_CANDLES:
             raise ProviderResponseError()
 
-        parsed: list[tuple[datetime, list[Any]]] = []
-        for candle in candles:
-            if not isinstance(candle, list) or len(candle) not in (6, 7):
-                raise ProviderResponseError()
-            timestamp = candle[0]
-            if not isinstance(timestamp, str):
-                raise ProviderResponseError()
-            try:
-                parsed_time = datetime.fromisoformat(timestamp)
-            except ValueError:
-                raise ProviderResponseError() from None
-            if parsed_time.tzinfo is not None:
-                raise ProviderResponseError()
-            prices = [_number(value) for value in candle[1:5]]
-            volume = _number(candle[5])
-            open_interest = _number(candle[6], allow_none=True) if len(candle) == 7 else None
-            parsed.append((parsed_time, [*prices, volume, open_interest]))
+        rows = _parse_candle_rows(candles)
+        parsed: list[tuple[datetime, list[Any]]] = [
+            (row.timestamp, [row.open, row.high, row.low, row.close, row.volume, row.open_interest])
+            for row in rows
+        ]
 
         warnings: list[str] = []
         timestamps = [timestamp for timestamp, _ in parsed]

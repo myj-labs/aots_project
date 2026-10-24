@@ -17,6 +17,7 @@ from .models import (
     StrategyEvaluationRequest,
 )
 from .paper import PaperBroker
+from .brokers.response_log import HISTORICAL_RESPONSE_LOG
 from .provider_session import (
     ProviderConnectRequest,
     ProviderRequestError,
@@ -25,6 +26,8 @@ from .provider_session import (
 from .risk import RiskEngine, RiskRejected
 from .strategy_service import StrategyService
 from .backtest.data import BacktestConfig
+from .options_backtest.config import OptionsBacktestConfig
+from .options_backtest.service import OptionsBacktestService, RunRejected
 from .backtest.replay import (
     ReplayCapacityError,
     ReplayNotFound,
@@ -40,15 +43,18 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 provider_session = ProviderSessionManager()
 replay_service = ReplayService()
+options_backtest_service = OptionsBacktestService(lambda: provider_session)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global replay_service
+    global replay_service, options_backtest_service
     replay_service = ReplayService()
+    options_backtest_service = OptionsBacktestService(lambda: provider_session)
     db.event("APP_STARTED", {"mode": settings.trading_mode, "broker": settings.broker})
     yield
     replay_service.shutdown()
+    options_backtest_service.shutdown()
     provider_session.shutdown()
     db.event("APP_STOPPED", {})
 
@@ -138,6 +144,21 @@ def provider_historical_candles_check(req: HistoricalCandlesCheckRequest):
         )
     except ProviderRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.get("/api/provider/response-log")
+def provider_response_log():
+    return {
+        "capacity": HISTORICAL_RESPONSE_LOG.capacity,
+        "scope": "Groww historical market-data responses only (expiries, contracts, candles); in memory, newest first.",
+        "entries": HISTORICAL_RESPONSE_LOG.snapshot(),
+    }
+
+
+@app.post("/api/provider/response-log/clear")
+def provider_response_log_clear():
+    HISTORICAL_RESPONSE_LOG.clear()
+    return {"cleared": True}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -258,6 +279,37 @@ def stop_historical_replay(session_id: str):
         return replay_service.stop(session_id)
     except ReplayNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/options-backtest/runs")
+def start_options_backtest(config: OptionsBacktestConfig):
+    if not provider_session.status().get("connected"):
+        raise HTTPException(status_code=409, detail="Connect Groww on the Groww tab before running a backtest.")
+    try:
+        return options_backtest_service.start(config)
+    except RunRejected as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.get("/api/options-backtest/runs")
+def list_options_backtests():
+    return options_backtest_service.list()
+
+
+@app.get("/api/options-backtest/runs/{run_id}")
+def options_backtest_run(run_id: str):
+    try:
+        return options_backtest_service.get(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Backtest run not found.") from exc
+
+
+@app.post("/api/options-backtest/runs/{run_id}/stop")
+def stop_options_backtest(run_id: str):
+    try:
+        return options_backtest_service.stop(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Backtest run not found.") from exc
 
 
 def _strategy_service():
