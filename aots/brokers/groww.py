@@ -85,6 +85,7 @@ SUPPORTED_EXCHANGE = "NSE"
 _TOKEN_RE = re.compile(r"^[\x21-\x7e]{8,4096}$")
 _EXPIRY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _GROWW_OPTION_SYMBOL_RE = re.compile(r"^NSE-NIFTY-[A-Za-z0-9.-]{1,64}-(CE|PE)$")
+_GROWW_FUTURE_SYMBOL_RE = re.compile(r"^NSE-NIFTY-[A-Za-z0-9.-]{1,64}-FUT$")
 _GROWW_CONTRACT_LIST_SYMBOL_RE = re.compile(r"^NSE-NIFTY-[A-Za-z0-9.-]{1,64}-(CE|PE|FUT)$")
 
 
@@ -449,6 +450,11 @@ class GrowwRuntimeConnection:
         return validated
 
     def get_historical_contracts(self, expiry_date: str) -> list[str]:
+        contracts = self._historical_contract_symbols(expiry_date)
+        # Keep the existing options API options-only; the raw mixed response remains in the diagnostic log.
+        return [value for value in contracts if _GROWW_OPTION_SYMBOL_RE.fullmatch(value)]
+
+    def _historical_contract_symbols(self, expiry_date: str) -> list[str]:
         validate_expiry(expiry_date)
         payload = self._get(
             "/v1/historical/contracts",
@@ -471,9 +477,24 @@ class GrowwRuntimeConnection:
             raise ProviderResponseError()
         if len(set(contracts)) != len(contracts):
             raise ProviderResponseError()
-        # Groww can include the underlying future in an options-chain response.
-        # Keep this API options-only; the raw mixed response remains in the diagnostic log.
-        return [value for value in contracts if _GROWW_OPTION_SYMBOL_RE.fullmatch(value)]
+        return contracts
+
+    def get_historical_future_contract(self, expiry_date: str) -> str | None:
+        """Return only the exact NIFTY future symbol listed for this expiry."""
+        try:
+            expiry = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise ValueError("expiry_date must use YYYY-MM-DD format.") from None
+        expected = f"NSE-NIFTY-{expiry.strftime('%d%b%y')}-FUT"
+        contracts = self._historical_contract_symbols(expiry_date)
+        matches = [
+            symbol
+            for symbol in contracts
+            if _GROWW_FUTURE_SYMBOL_RE.fullmatch(symbol) and symbol.casefold() == expected.casefold()
+        ]
+        if len(matches) > 1:
+            raise ProviderResponseError()
+        return matches[0] if matches else None
 
     def _validate_candle_window(self, start_time: datetime, end_time: datetime, candle_interval: str) -> None:
         if candle_interval not in {"1minute", "5minute", "10minute", "15minute"}:
@@ -496,7 +517,7 @@ class GrowwRuntimeConnection:
         end_time: datetime,
         candle_interval: str,
     ) -> list[HistoricalCandle]:
-        """Read-only candles for the NIFTY index (CASH) or a NIFTY option contract (FNO).
+        """Read-only candles for the NIFTY index (CASH) or a listed NIFTY derivative (FNO).
 
         Rows are returned exactly as supplied (timezone-unspecified, unsorted if the
         provider sent them unsorted); quality judgement belongs to the caller.
@@ -505,8 +526,11 @@ class GrowwRuntimeConnection:
             if groww_symbol != f"{SUPPORTED_EXCHANGE}-{SUPPORTED_INDEX}":
                 raise ValueError("Only the NIFTY index is supported for CASH candles.")
         elif segment == "FNO":
-            if not _GROWW_OPTION_SYMBOL_RE.fullmatch(groww_symbol):
-                raise ValueError("Choose a NIFTY option contract returned by Groww.")
+            if not (
+                _GROWW_OPTION_SYMBOL_RE.fullmatch(groww_symbol)
+                or _GROWW_FUTURE_SYMBOL_RE.fullmatch(groww_symbol)
+            ):
+                raise ValueError("Choose a NIFTY option or future contract returned by Groww.")
         else:
             raise ValueError("segment must be CASH or FNO.")
         self._validate_candle_window(start_time, end_time, candle_interval)

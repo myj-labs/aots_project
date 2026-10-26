@@ -73,6 +73,9 @@ class ProviderConnection(MarketDataProvider, AccountInsightsProvider, Protocol):
     def get_historical_contracts(self, expiry_date: str) -> list[str]:
         """Return documented historical derivative contract symbols."""
 
+    def get_historical_future_contract(self, expiry_date: str) -> str | None:
+        """Return the exact listed NIFTY future symbol for an expiry, if present."""
+
     def check_historical_candles(
         self, groww_symbol, start_time, end_time, candle_interval
     ) -> dict:
@@ -259,6 +262,14 @@ class ProviderSessionManager:
     def historical_contracts(self, expiry_date: str) -> list[str]:
         try:
             return self._active_connection().get_historical_contracts(expiry_date)
+        except ValueError as exc:
+            raise ProviderRequestError(str(exc), 422)
+        except ProviderError as exc:
+            self._on_provider_error(exc)
+
+    def historical_future_contract(self, expiry_date: str) -> str | None:
+        try:
+            return self._active_connection().get_historical_future_contract(expiry_date)
         except ValueError as exc:
             raise ProviderRequestError(str(exc), 422)
         except ProviderError as exc:

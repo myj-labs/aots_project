@@ -20,6 +20,7 @@ from aots.options_backtest import data as ob_data
 from aots.options_backtest import engine as ob_engine
 from aots.options_backtest.config import CostConfig, OptionsBacktestConfig
 from aots.options_backtest.engine import OptionUnavailable, compute_costs, run_session, summarize
+from aots.options_backtest.forensics import build_loss_dashboard, build_trade_loss_report
 from aots.options_backtest.service import (
     GrowwOptionResolver,
     OptionsBacktestService,
@@ -59,6 +60,18 @@ def index_candles(day=DAY, overrides=None, drop=()):
     return rows
 
 
+def future_candles(day=DAY, overrides=None, drop=()):
+    rows = []
+    for ts in grid(day):
+        key = ts.strftime("%H:%M")
+        if key in drop:
+            continue
+        values = (22000, 22010, 21990, 22000)
+        values = (overrides or {}).get(key, values)
+        rows.append(candle(ts, *values, vol=1000))
+    return rows
+
+
 def option_candles(day=DAY, overrides=None, drop=(), price=100):
     rows = []
     for ts in grid(day):
@@ -77,9 +90,10 @@ def cfg(**overrides):
 
 
 class FakeSource:
-    def __init__(self, underlying=None, options=None, expiries=None, contracts=None, error=None):
+    def __init__(self, underlying=None, options=None, futures=None, expiries=None, contracts=None, error=None):
         self.underlying = underlying if underlying is not None else {DAY: index_candles()}
         self.options = options if options is not None else {}
+        self.futures = futures if futures is not None else {}
         self.expiries = expiries if expiries is not None else {(2024, 1): [EXPIRY.isoformat()]}
         self.contracts = contracts if contracts is not None else {
             EXPIRY.isoformat(): [
@@ -109,17 +123,30 @@ class FakeSource:
             raise self.error
         return list(self.contracts.get(expiry, []))
 
+    def historical_future_contract(self, expiry):
+        self.calls.append(("future_contract", expiry))
+        if self.error:
+            raise self.error
+        return next(
+            (symbol for symbol in self.contracts.get(expiry, []) if symbol.endswith("-FUT")),
+            None,
+        )
+
     def historical_candles(self, segment, symbol, start, end, interval):
         self.calls.append(("candles", segment, symbol, start, end, interval))
         if self.error:
             raise self.error
         if segment == "CASH":
             return list(self.underlying.get(start.date(), []))
+        if symbol.endswith("-FUT"):
+            return list(self.futures.get((symbol, start.date()), []))
         return list(self.options.get((symbol, start.date()), []))
 
 
 CE = "NSE-NIFTY-04Jan24-22050-CE"
 PE = "NSE-NIFTY-04Jan24-21950-PE"
+FUT = "NSE-NIFTY-04Jan24-FUT"
+MONTHLY_FUT = "NSE-NIFTY-25Jan24-FUT"
 UP_10_00 = {"10:00": (22040, 22070, 22030, 22060)}  # closes above 22050 -> CE, ATM 22050
 DOWN_10_00 = {"10:00": (21960, 21970, 21930, 21940)}  # closes below 21950 -> PE, ATM 21950
 
@@ -225,6 +252,135 @@ def test_pe_breakout_selects_put_and_atm_strike_and_otm_offset():
     assert ob_engine.target_strike(21940, "DOWN", cfg(strike_offset_steps=2)) == 21850
 
 
+def test_loss_reports_are_created_only_for_completed_negative_net_pnl_trades():
+    losing_result, _ = run_one(
+        DOWN_10_00,
+        {(PE, DAY): option_candles(overrides={"10:10": (100, 101, 70, 72)})},
+    )
+    winning_result, _ = run_one(
+        UP_10_00,
+        {(CE, DAY): option_candles(overrides={"10:10": (100, 160, 99, 150)})},
+    )
+
+    assert len(losing_result.loss_reports) == 1
+    assert losing_result.loss_reports[0]["generated_for_completed_loss"] is True
+    assert losing_result.loss_reports[0]["summary"]["net_pnl"] < 0
+    assert winning_result.trades[0]["net_pnl"] > 0
+    assert winning_result.loss_reports == []
+
+
+def test_loss_report_reconstructs_only_through_exit_and_is_json_serializable():
+    options = {(PE, DAY): option_candles(overrides={"10:10": (100, 101, 70, 72)})}
+    result, source = run_one(DOWN_10_00, options)
+    trade, = result.trades
+    report = build_trade_loss_report(
+        trade,
+        run_id="direct",
+        config=cfg(),
+        underlying_candles=source.underlying[DAY],
+        option_candles=options[(PE, DAY)],
+    )
+    exit_timestamp = datetime.fromisoformat(trade["exit_time"])
+    underlying_with_uncompleted_exit_bar = [
+        candle(row.timestamp, 99000, 99010, 98990, 99000)
+        if row.timestamp == exit_timestamp else row
+        for row in source.underlying[DAY]
+    ]
+    later_candles = [
+        *options[(PE, DAY)],
+        candle(datetime.combine(DAY, time(10, 15)), 500, 700, 450, 600),
+    ]
+    report_with_future_data = build_trade_loss_report(
+        trade,
+        run_id="direct",
+        config=cfg(),
+        underlying_candles=underlying_with_uncompleted_exit_bar,
+        option_candles=later_candles,
+    )
+
+    assert report == result.loss_reports[0] == report_with_future_data
+    assert report["report_id"] == f"direct:{trade['trade_id']}:loss-forensics-v1"
+    assert report["summary"]["entry_fill_price"] == trade["entry_premium"]
+    assert report["summary"]["exit_fill_price"] == trade["exit_premium"]
+    assert report["summary"]["gross_pnl"] == trade["gross_pnl"]
+    assert all(row["timestamp"] <= trade["exit_time"] for row in report["timeline"])
+    assert all(
+        datetime.fromisoformat(row["timestamp"]) + timedelta(minutes=cfg().interval_minutes) <= exit_timestamp
+        for row in report["timeline"] if row["event"] == "NIFTY_CASH_CANDLE"
+    )
+    assert report["underlying_vs_option"]["greeks"].startswith("unavailable")
+    assert report["entry_quality"]["data_validation"]["timestamp_timezone"].startswith("provider")
+    json.dumps(report)
+
+
+def test_loss_report_marks_missing_candles_and_unavailable_market_fields():
+    result, _ = run_one(
+        DOWN_10_00,
+        {(PE, DAY): option_candles(
+            drop=("10:10",),
+            overrides={"10:15": (100, 101, 70, 72)},
+        )},
+    )
+
+    report, = result.loss_reports
+    assert report["entry_quality"]["data_validation"]["option_candle_gaps"]
+    assert any(
+        finding["code"] == "DATA_QUALITY_ISSUE"
+        for finding in report["root_causes"]
+    )
+    assert report["underlying_vs_option"]["implied_volatility"] == "unavailable; not inferred"
+    assert report["underlying_vs_option"]["bid_ask_and_liquidity"] == "unavailable; not inferred"
+
+
+def test_loss_dashboard_reports_sample_sizes_and_loss_patterns():
+    losing_result, _ = run_one(
+        DOWN_10_00,
+        {(PE, DAY): option_candles(overrides={"10:10": (100, 101, 70, 72)})},
+    )
+    losing_trade = losing_result.trades[0]
+    second_loss = {
+        **losing_trade,
+        "trade_id": "2024-01-03-1",
+        "session_date": "2024-01-03",
+        "entry_time": "2024-01-03T10:05:00",
+        "contract": {**losing_trade["contract"], "expiry": "2024-01-04"},
+    }
+    winner = {**losing_trade, "trade_id": "2024-01-03-2", "net_pnl": 100.0}
+    dashboard = build_loss_dashboard(
+        [losing_trade, second_loss, winner],
+        losing_result.loss_reports,
+    )
+
+    assert dashboard["sample_sizes"] == {"losing_trades": 2, "all_completed_trades": 3}
+    assert dashboard["by_option_type"]["PE"]["count"] == 2
+    assert dashboard["false_breakout"]["sample_size"] == 2
+    group = dashboard["losses_vs_winners_by_side_and_exit"][
+        f"PE|{losing_trade['exit_strategy']}"
+    ]
+    assert group["all_trade_sample_size"] == 3
+    assert group["loser_sample_size"] == 2
+
+
+def test_trade_is_marked_false_breakout_when_nifty_closes_back_inside_before_exit():
+    result, _ = run_one(
+        UP_10_00,
+        {(CE, DAY): option_candles(overrides={"10:10": (100, 160, 99, 150)})},
+    )
+    trade, = result.trades
+    assert trade["false_breakout"] is True
+    assert trade["false_breakout_time"].endswith("10:10:00")
+
+
+def test_trade_is_not_marked_false_breakout_if_nifty_remains_beyond_opening_range():
+    result, _ = run_one(
+        {**UP_10_00, "10:05": (22050, 22070, 22040, 22060)},
+        {(CE, DAY): option_candles(overrides={"10:10": (100, 160, 99, 150)})},
+    )
+    trade, = result.trades
+    assert trade["false_breakout"] is False
+    assert trade["false_breakout_time"] is None
+
+
 @pytest.mark.parametrize(
     ("bar", "exit_reason", "exit_price"),
     [
@@ -261,6 +417,429 @@ def test_fixed_stop_must_leave_a_positive_stop_price():
     assert result.trades == []
     assert result.signals[0]["reason_code"] == "invalid_absolute_stop"
     assert "must be less than" in result.signals[0]["reason"]
+
+
+def test_atr_trailing_stop_updates_after_completed_candle_and_exits_before_target():
+    options = {
+        (CE, DAY): option_candles(
+            overrides={
+                "10:05": (100, 110, 99, 108),
+                "10:10": (106, 120, 102, 104),
+            }
+        )
+    }
+    result, _ = run_one(
+        UP_10_00,
+        options,
+        atr_period=2,
+        atr_multiplier=1,
+        target_pct=10,
+    )
+    trade, = result.trades
+    assert trade["entry_premium"] == 100
+    assert trade["stop_premium"] == 75
+    assert trade["target_premium"] == 110
+    assert trade["exit_reason"] == "ATR_TRAILING_STOP"
+    assert trade["exit_time"].endswith("10:10:00")
+    assert trade["exit_premium"] == pytest.approx(103.5)
+    assert trade["atr_trailing_stop_premium"] == pytest.approx(103.5)
+    assert trade["atr_period"] == 2 and trade["atr_multiplier"] == 1
+    assert any("stop-first assumed" in warning for warning in trade["warnings"])
+
+
+def test_initial_stop_remains_active_while_atr_is_warming_up():
+    options = {
+        (CE, DAY): option_candles(overrides={"10:05": (100, 101, 70, 75)})
+    }
+    result, _ = run_one(
+        UP_10_00,
+        options,
+        atr_period=20,
+        atr_multiplier=2,
+    )
+    trade, = result.trades
+    assert trade["exit_reason"] == "STOP_LOSS"
+    assert trade["exit_premium"] == 75
+    assert trade["atr_trailing_stop_premium"] is None
+
+
+def test_peak_premium_trailing_stop_raises_on_close_and_exits_on_later_reversal():
+    options = {(CE, DAY): option_candles(overrides={
+        "10:05": (100, 180, 80, 100),  # Entry-candle high/low are deliberately ignored.
+        "10:10": (100, 110, 99, 108),
+        "10:15": (108, 109, 104, 105),
+    })}
+    result, _ = run_one(
+        UP_10_00,
+        options,
+        exit_mode="TRAILING_STOP",
+        trailing_stop_distance=5,
+        target_pct=100,
+    )
+    trade, = result.trades
+    assert trade["exit_strategy"] == "trailing_stop"
+    assert trade["exit_reason"] == "TRAILING_STOP"
+    assert trade["exit_premium"] == 105
+    assert trade["highest_premium_since_entry"] == 110
+    assert trade["highest_premium_time"].endswith("10:10:00")
+    assert trade["trailing_stop_at_exit"] == 105
+    assert trade["maximum_favourable_excursion"] == 10
+    assert trade["maximum_adverse_excursion"] == 1
+    assert trade["max_premium_reached"] == 110
+    assert "Entry candle OHLC" in trade["excursion_basis"]
+
+
+def test_trailing_activation_not_reached_leaves_trail_inactive():
+    options = {(CE, DAY): option_candles(overrides={
+        "10:10": (100, 109, 99, 108),
+    })}
+    result, _ = run_one(
+        UP_10_00,
+        options,
+        exit_strategy="trailing_stop",
+        trailing_stop_activation=10,
+        target_pct=100,
+    )
+    trade, = result.trades
+    assert trade["exit_reason"] == "TIME_EXIT"
+    assert trade["trailing_stop_at_exit"] is None
+    assert trade["highest_premium_since_entry"] == 109
+
+
+def test_trailing_initial_stop_can_exit_before_activation():
+    options = {(CE, DAY): option_candles(overrides={
+        "10:10": (100, 102, 90, 95),
+    })}
+    result, _ = run_one(
+        UP_10_00,
+        options,
+        exit_strategy="trailing_stop",
+        initial_stop_loss=5,
+        trailing_stop_activation=20,
+    )
+    trade, = result.trades
+    assert trade["exit_reason"] == "STOP_LOSS"
+    assert trade["exit_premium"] == 95
+    assert trade["trailing_stop_at_exit"] is None
+
+
+def test_trailing_stop_does_not_use_new_high_before_same_candle_low():
+    options = {(CE, DAY): option_candles(overrides={
+        "10:10": (100, 120, 100, 115),  # Newly calculated stop would be 115.
+        "10:15": (115, 116, 114, 115),
+    })}
+    result, _ = run_one(
+        UP_10_00,
+        options,
+        exit_strategy="trailing_stop",
+        trailing_stop_distance=5,
+        target_pct=100,
+    )
+    trade, = result.trades
+    assert trade["exit_reason"] == "TRAILING_STOP"
+    assert trade["exit_time"].endswith("10:15:00")
+    assert trade["exit_premium"] == 115
+
+
+def test_trailing_gap_fills_at_open_and_reuses_cost_model():
+    options = {(CE, DAY): option_candles(overrides={
+        "10:10": (120, 121, 119, 120),
+        "10:15": (110, 112, 108, 110),
+    })}
+    result, _ = run_one(
+        UP_10_00,
+        options,
+        exit_strategy="trailing_stop",
+        trailing_stop_distance=5,
+        target_pct=100,
+        costs=CostConfig(brokerage_per_order_inr=20, slippage_per_unit_inr=0.5),
+    )
+    trade, = result.trades
+    assert trade["exit_reason"] == "TRAILING_STOP"
+    assert trade["trailing_stop_at_exit"] == 116
+    assert trade["exit_premium"] == 110
+    assert trade["costs"]["brokerage"] == 40
+    assert trade["costs"]["slippage"] == 25
+    assert trade["net_pnl"] == trade["gross_pnl"] - trade["costs"]["total_costs"]
+
+
+@pytest.mark.parametrize(
+    ("direction", "option_type", "symbol"),
+    [(UP_10_00, "CE", CE), (DOWN_10_00, "PE", PE)],
+)
+def test_peak_trailing_logic_is_shared_by_long_ce_and_pe(direction, option_type, symbol):
+    options = {(symbol, DAY): option_candles(overrides={
+        "10:10": (100, 110, 99, 108),
+        "10:15": (108, 109, 104, 105),
+    })}
+    result, _ = run_one(
+        direction,
+        options,
+        exit_strategy="trailing_stop",
+        trailing_stop_distance=5,
+        target_pct=100,
+    )
+    trade, = result.trades
+    assert trade["contract"]["option_type"] == option_type
+    assert trade["exit_reason"] == "TRAILING_STOP"
+    assert trade["exit_premium"] == 105
+
+
+def test_trailing_entry_candle_extreme_is_excluded_and_missing_candles_are_reported():
+    options = {(CE, DAY): option_candles(
+        overrides={"10:05": (100, 180, 80, 100), "10:10": (100, 102, 99, 101)},
+        drop=("10:15",),
+    )}
+    result, _ = run_one(
+        UP_10_00,
+        options,
+        exit_strategy="trailing_stop",
+        target_pct=100,
+    )
+    trade, = result.trades
+    assert trade["highest_premium_since_entry"] == 102
+    assert trade["max_premium_reached"] == 102
+    assert any("missing while the position was open" in warning for warning in trade["warnings"])
+
+
+def test_trailing_session_end_can_be_disabled_without_inventing_exit_price():
+    result, _ = run_one(
+        UP_10_00,
+        {(CE, DAY): option_candles()},
+        exit_strategy="trailing_stop",
+        exit_on_session_end=False,
+        target_pct=100,
+    )
+    assert result.trades == []
+    assert result.signals[0]["reason_code"] == "exit_data_missing"
+    assert "no overnight carry" in result.signals[0]["reason"]
+
+
+def test_trailing_peak_state_resets_for_each_position():
+    underlying = {
+        **UP_10_00,
+        "10:15": (22000, 22010, 21990, 22000),
+        "10:20": (22040, 22070, 22030, 22060),
+    }
+    options = {(CE, DAY): option_candles(overrides={
+        "10:10": (100, 120, 99, 115),
+        "10:15": (118, 119, 110, 112),
+        "10:25": (100, 150, 90, 100),  # The second entry candle is also excluded.
+        "10:30": (100, 104, 99, 102),
+    })}
+    result, _ = run_one(
+        underlying,
+        options,
+        exit_strategy="trailing_stop",
+        trailing_stop_distance=5,
+        target_pct=100,
+        max_trades_per_session=2,
+    )
+    first, second = result.trades
+    assert first["exit_reason"] == "TRAILING_STOP"
+    assert first["highest_premium_since_entry"] == 120
+    assert second["highest_premium_since_entry"] == 104
+    assert second["highest_premium_time"].endswith("10:30:00")
+
+
+def test_no_additional_exit_strategy_disables_atr_and_vwap():
+    options = {
+        (CE, DAY): option_candles(
+            overrides={
+                "10:05": (100, 140, 99, 130),
+                "10:10": (120, 121, 110, 115),
+            }
+        )
+    }
+    result, _ = run_one(
+        UP_10_00,
+        options,
+        exit_strategy="none",
+        target_pct=100,
+    )
+    trade, = result.trades
+    assert trade["exit_reason"] == "TIME_EXIT"
+    assert trade["exit_strategy"] == "none"
+    assert trade["atr_trailing_stop_premium"] is None
+
+
+def test_vwap_exit_for_ce_uses_completed_nifty_close_and_next_option_open():
+    underlying = index_candles(overrides={
+        **UP_10_00,
+        "10:05": (22000, 22010, 21990, 21990),
+    })
+    source = FakeSource(
+        underlying={DAY: underlying},
+        options={(CE, DAY): option_candles(overrides={"10:10": (92, 96, 91, 94)})},
+        futures={(FUT, DAY): future_candles(overrides={"10:05": (22000, 22010, 21990, 21990)})},
+        contracts={EXPIRY.isoformat(): [CE, FUT]},
+    )
+    config_obj = cfg(exit_strategy="vwap", target_pct=100)
+    result = run_session(
+        DAY,
+        source.underlying[DAY],
+        config_obj,
+        GrowwOptionResolver(source, config_obj),
+        config_obj.initial_capital_inr,
+        vwap_rows=source.futures[(FUT, DAY)],
+        vwap_symbol=FUT,
+    )
+    trade, = result.trades
+    assert trade["exit_strategy"] == "vwap"
+    assert trade["exit_reason"] == "VWAP_EXIT"
+    assert trade["exit_time"].endswith("10:10:00")
+    assert trade["exit_premium"] == 92
+    assert trade["vwap_exit_signal_time"].endswith("10:10:00")
+    assert trade["vwap_at_exit"] is not None
+    assert trade["atr_trailing_stop_premium"] is None
+
+
+def test_vwap_exit_for_pe_uses_close_above_vwap():
+    underlying = index_candles(overrides={
+        **DOWN_10_00,
+        "10:05": (22000, 22020, 21995, 22020),
+    })
+    source = FakeSource(
+        underlying={DAY: underlying},
+        options={(PE, DAY): option_candles(overrides={"10:10": (93, 97, 92, 95)})},
+        futures={(FUT, DAY): future_candles(overrides={"10:05": (22000, 22020, 21995, 22020)})},
+        contracts={EXPIRY.isoformat(): [PE, FUT]},
+    )
+    config_obj = cfg(exit_strategy="vwap", target_pct=100)
+    result = run_session(
+        DAY,
+        source.underlying[DAY],
+        config_obj,
+        GrowwOptionResolver(source, config_obj),
+        config_obj.initial_capital_inr,
+        vwap_rows=source.futures[(FUT, DAY)],
+        vwap_symbol=FUT,
+    )
+    trade, = result.trades
+    assert trade["contract"]["option_type"] == "PE"
+    assert trade["exit_reason"] == "VWAP_EXIT"
+    assert trade["exit_time"].endswith("10:10:00")
+
+
+def test_vwap_exit_rejects_missing_future_volume_or_incomplete_future_session():
+    rows_without_volume = [
+        HistoricalCandle(row.timestamp, row.open, row.high, row.low, row.close, None)
+        for row in future_candles()
+    ]
+    config_obj = cfg(exit_strategy="vwap")
+    no_volume = run_session(
+        DAY,
+        index_candles(overrides=UP_10_00),
+        config_obj,
+        lambda *_: pytest.fail("resolver must not run when VWAP volume is missing"),
+        config_obj.initial_capital_inr,
+        vwap_rows=rows_without_volume,
+        vwap_symbol=FUT,
+    )
+    assert no_volume.status == "excluded"
+    assert no_volume.reason_code == "invalid_vwap_future_data"
+    assert "volume" in no_volume.reason
+
+    incomplete = run_session(
+        DAY,
+        index_candles(overrides=UP_10_00),
+        config_obj,
+        lambda *_: pytest.fail("resolver must not run when VWAP data has a gap"),
+        config_obj.initial_capital_inr,
+        vwap_rows=future_candles(drop=("11:00",)),
+        vwap_symbol=FUT,
+    )
+    assert incomplete.status == "excluded"
+    assert incomplete.reason_code == "vwap_data_incomplete"
+    assert "candle(s) were missing" in incomplete.reason
+
+
+def test_vwap_future_resolver_uses_exact_listed_future_and_its_candles():
+    source = FakeSource(
+        futures={(FUT, DAY): future_candles()},
+        contracts={EXPIRY.isoformat(): [CE, FUT]},
+    )
+    config_obj = cfg(exit_strategy="vwap")
+    symbol, rows = GrowwOptionResolver(source, config_obj).vwap_future(DAY)
+    assert symbol == FUT
+    assert len(rows) == 75
+    assert ("future_contract", EXPIRY.isoformat()) in source.calls
+    assert any(call[:3] == ("candles", "FNO", FUT) for call in source.calls)
+
+
+def test_vwap_resolver_uses_nearest_later_listed_future_when_option_expiry_has_none():
+    later_expiry = date(2024, 1, 25)
+    source = FakeSource(
+        futures={(MONTHLY_FUT, DAY): future_candles()},
+        expiries={(2024, 1): [EXPIRY.isoformat(), later_expiry.isoformat()]},
+        contracts={
+            EXPIRY.isoformat(): [CE],
+            later_expiry.isoformat(): [MONTHLY_FUT],
+        },
+    )
+    symbol, rows = GrowwOptionResolver(source, cfg(exit_strategy="vwap")).vwap_future(DAY)
+    assert symbol == MONTHLY_FUT and len(rows) == 75
+    queried = [call[1] for call in source.calls if call[0] == "future_contract"]
+    assert queried == [EXPIRY.isoformat(), later_expiry.isoformat()]
+
+
+def test_execute_backtest_wires_futures_vwap_but_keeps_cash_orb_signal():
+    source = FakeSource(
+        underlying={DAY: index_candles(overrides=UP_10_00)},
+        options={(CE, DAY): option_candles(overrides={"10:10": (92, 96, 91, 94)})},
+        futures={(FUT, DAY): future_candles(overrides={"10:05": (22000, 22010, 21990, 21990)})},
+        contracts={EXPIRY.isoformat(): [CE, FUT]},
+    )
+    result = execute_backtest(source, cfg(exit_strategy="vwap", target_pct=100))
+    trade, = result["trades"]
+    assert trade["exit_reason"] == "VWAP_EXIT"
+    assert trade["contract"]["groww_symbol"] == CE
+    assert result["sessions"][0]["vwap_symbol"] == FUT
+    assert result["data_source"]["underlying_segment"] == "CASH"
+    assert result["data_source"]["vwap_underlying_segment"] == "FNO"
+
+
+def test_paired_exit_comparison_uses_shared_entries_and_waits_for_all_exits():
+    underlying = index_candles(overrides={
+        **UP_10_00,
+        "10:05": (22000, 22010, 21990, 21990),
+        "10:15": (22000, 22010, 21990, 22000),
+        "10:20": (22040, 22070, 22030, 22060),
+    })
+    source = FakeSource(
+        underlying={DAY: underlying},
+        options={(CE, DAY): option_candles(overrides={
+            "10:10": (100, 110, 99, 108),
+            "10:15": (108, 109, 104, 105),
+        })},
+        futures={(FUT, DAY): future_candles(overrides={
+            "10:05": (22000, 22010, 21990, 21990),
+        })},
+        contracts={EXPIRY.isoformat(): [CE, FUT]},
+    )
+    result = execute_backtest(
+        source,
+        cfg(
+            exit_strategy="vwap",
+            compare_vwap_and_trailing=True,
+            trailing_stop_distance=5,
+            trailing_stop_comparison_distances=[3, 10],
+            target_pct=100,
+            max_trades_per_session=2,
+        ),
+    )
+    assert len(result["comparison_trades"]) == 4
+    assert {trade["paired_entry_id"] for trade in result["comparison_trades"]} == {
+        result["trades"][0]["trade_id"]
+    }
+    assert len({trade["entry_time"] for trade in result["comparison_trades"]}) == 1
+    assert len({trade["contract"]["groww_symbol"] for trade in result["comparison_trades"]}) == 1
+    assert result["trades"][0]["exit_reason"] == "VWAP_EXIT"
+    assert result["exit_comparison"]["VWAP"]["trade_count"] == 1
+    assert result["exit_comparison"]["TRAILING_STOP ₹3"]["trade_count"] == 1
+    assert result["exit_comparison"]["TRAILING_STOP ₹10"]["trade_count"] == 1
+    assert all(trade["quantity"] == 25 for trade in result["comparison_trades"])
+    assert len(result["trades"]) == 1  # The second breakout is after entry but before the slowest shared exit.
 
 
 def test_side_mode_ignores_unwanted_direction():
@@ -306,7 +885,7 @@ def test_selected_interval_drives_validation_signals_fills_and_max_premium(inter
     entry_time = stamps[signal_index + 1]
     entry_index = stamps.index(entry_time)
     options[entry_index] = candle(entry_time, 100, 106, 99, 102)
-    config_obj = cfg(candle_interval=interval, opening_range_minutes=60)
+    config_obj = cfg(candle_interval=interval, opening_range_minutes=60, atr_multiplier=20)
     contract = "NSE-NIFTY-04Jan24-22050-CE"
     source = FakeSource(
         underlying={DAY: underlying},
@@ -328,9 +907,13 @@ def test_selected_interval_drives_validation_signals_fills_and_max_premium(inter
     assert trade["signal_time"] == entry_time.isoformat()
     assert trade["entry_time"] == entry_time.isoformat()
     assert trade["exit_reason"] == "TIME_EXIT"
-    assert trade["max_premium_reached"] == 106
-    assert trade["max_premium_time"] == entry_time.isoformat()
-    assert "intrabar path ordering is unknown" in trade["max_premium_basis"]
+    assert trade["max_premium_reached"] == 101
+    assert trade["max_premium_time"] == (entry_time + timedelta(minutes=minutes)).isoformat()
+    assert trade["highest_premium_between_entry_and_exit"] == 101
+    assert trade["highest_premium_between_entry_and_exit_time"] == (
+        entry_time + timedelta(minutes=minutes)
+    ).isoformat()
+    assert "intrabar path ordering" in trade["max_premium_basis"]
     candle_calls = [call for call in source.calls if call[0] == "candles"]
     assert [(call[1], call[-1]) for call in candle_calls] == [
         ("CASH", interval),
@@ -338,15 +921,44 @@ def test_selected_interval_drives_validation_signals_fills_and_max_premium(inter
     ]
 
 
-def test_max_premium_stops_at_exit_candle_and_includes_its_high():
+def test_highest_premium_excludes_entry_and_exit_candle_ambiguous_extremes():
     options = {(CE, DAY): option_candles(overrides={
-        "10:10": (100, 160, 99, 102),
-        "10:15": (100, 200, 99, 102),
+        "10:05": (100, 180, 80, 100),  # Entry fill is at the open; later high/low order is unknown.
+        "10:10": (100, 120, 99, 102),  # Fully completed while the position is open.
+        "10:15": (70, 200, 65, 75),  # Stop gap exit; high may have occurred after the open fill.
+        "10:20": (100, 300, 99, 102),  # After exit and must never contribute.
     })}
-    result, _ = run_one(UP_10_00, options)
+    result, _ = run_one(UP_10_00, options, target_pct=100)
     trade, = result.trades
-    assert trade["max_premium_reached"] == 160
-    assert trade["max_premium_time"] == trade["exit_time"]
+    assert trade["exit_reason"] == "STOP_LOSS"
+    assert trade["exit_premium"] == 70
+    assert trade["highest_premium_between_entry_and_exit"] == 120
+    assert trade["highest_premium_between_entry_and_exit_time"].endswith("10:10:00")
+    assert trade["max_premium_reached"] == 120
+    assert trade["max_premium_time"].endswith("10:10:00")
+    assert trade["gross_pnl"] == -750
+    assert trade["net_pnl"] == -750
+    assert trade["hypothetical_peak_exit_gross_pnl"] == 500
+    assert trade["hypothetical_peak_exit_net_pnl"] == 500
+    assert "strictly before the exit candle" in trade["max_premium_basis"]
+
+
+def test_hypothetical_peak_exit_pnl_uses_configured_costs():
+    result, _ = run_one(
+        UP_10_00,
+        {(CE, DAY): option_candles(overrides={
+            "10:10": (100, 110, 99, 105),
+            "10:15": (105, 106, 90, 95),
+        })},
+        costs=CostConfig(brokerage_per_order_inr=20, slippage_per_unit_inr=0.5),
+        target_pct=100,
+    )
+    trade, = result.trades
+    assert trade["highest_premium_between_entry_and_exit"] == 110
+    assert trade["hypothetical_peak_exit_gross_pnl"] == 250
+    assert trade["hypothetical_peak_exit_costs"]["brokerage"] == 40
+    assert trade["hypothetical_peak_exit_costs"]["slippage"] == 25
+    assert trade["hypothetical_peak_exit_net_pnl"] == 185
 
 
 def test_same_candle_stop_and_target_is_stop_first_and_flagged():
@@ -574,6 +1186,38 @@ def test_drawdown_profit_factor_and_win_rate():
     assert wins["max_drawdown_inr"] == 0
     flat = summarize([fake_session([0])], cfg(), [DAY])
     assert flat["breakeven_trades"] == 1 and flat["win_rate_pct"] == 0
+    daily = s["daily_pnl"][0]
+    assert daily == {
+        "session_date": DAY.isoformat(),
+        "session_status": "complete",
+        "trade_count": 4,
+        "winning_trades": 2,
+        "losing_trades": 2,
+        "win_rate_pct": 50,
+        "gross_pnl": 170,
+        "net_pnl": 170,
+    }
+
+
+def test_daily_pnl_includes_zero_trade_session_with_unavailable_win_rate():
+    empty_day = {
+        "session_date": (DAY + timedelta(days=1)).isoformat(),
+        "status": "complete",
+        "reason_code": None,
+        "trades": [],
+        "signals": [],
+    }
+    summary = summarize([fake_session([100]), empty_day], cfg(), [DAY, DAY + timedelta(days=1)])
+    assert summary["daily_pnl"][1] == {
+        "session_date": (DAY + timedelta(days=1)).isoformat(),
+        "session_status": "complete",
+        "trade_count": 0,
+        "winning_trades": 0,
+        "losing_trades": 0,
+        "win_rate_pct": None,
+        "gross_pnl": 0,
+        "net_pnl": 0,
+    }
 
 
 # ---------- config ----------
@@ -590,6 +1234,10 @@ def test_drawdown_profit_factor_and_win_rate():
         {"exit_level_mode": "price"},
         {"stop_loss_points": 0},
         {"target_points": 0},
+        {"exit_strategy": "ema"},
+        {"exit_mode": "EMA"},
+        {"atr_period": 0},
+        {"atr_multiplier": 0},
         {"max_trades_per_session": 1001},
         {"unexpected": 1},
     ],
@@ -604,10 +1252,15 @@ def test_config_requires_explicit_lot_size_and_has_no_cost_defaults():
         OptionsBacktestConfig(start_date=DAY, end_date=DAY)
     assert cfg().costs.configured is False
     assert any("opening range" in rule.lower() for rule in cfg().rules_description())
+    with pytest.raises(ValidationError):
+        cfg(compare_vwap_and_trailing=True)
 
 
 def test_options_backtest_ui_does_not_cap_trade_limit_at_three():
     html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert re.search(r'data-tab="daily-pnl"[^>]*>Day-wise P&amp;L</button>', html)
+    assert 'id="options-backtest-daily-pnl" data-app-tab="daily-pnl"' in html
+    assert "Total trades" in html and "Win rate" in html
     match = re.search(r'<input name="max_trades_per_session"[^>]*>', html)
     assert match is not None
     assert 'max="3"' not in match.group()
@@ -625,6 +1278,45 @@ def test_options_backtest_ui_does_not_cap_trade_limit_at_three():
     assert re.findall(r'<option value="([^"]+)"', exit_mode.group(1)) == ["percentage", "premium_points"]
     assert 'name="stop_loss_pct"' in options_panel and 'name="target_pct"' in options_panel
     assert 'name="stop_loss_points"' in options_panel and 'name="target_points"' in options_panel
+    assert 'name="atr_period"' in options_panel and 'value="14"' in options_panel
+    assert 'name="atr_multiplier"' in options_panel and 'value="2"' in options_panel
+    exit_strategy = re.search(r'<select name="exit_strategy">(.*?)</select>', options_panel)
+    assert exit_strategy is not None
+    assert re.findall(r'<option value="([^"]+)"', exit_strategy.group(1)) == [
+        "none", "atr", "vwap", "trailing_stop"
+    ]
+    assert 'name="trailing_stop_distance"' in options_panel
+    assert 'name="trailing_stop_activation"' in options_panel
+    assert 'name="initial_stop_loss"' in options_panel
+    assert 'name="exit_on_session_end"' in options_panel
+    assert 'name="compare_vwap_and_trailing"' in options_panel
+    assert 'name="trailing_stop_comparison_distances"' in options_panel
+    assert "today allowed after 15:30 IST" in options_panel
+    assert cfg(exit_mode="TRAILING_STOP").exit_strategy == "trailing_stop"
+    for heading in (
+        "<th>Entry Time</th>",
+        "<th>Entry Price</th>",
+        "<th>Exit Time</th>",
+        "<th>Exit Price</th>",
+        "<th>Highest premium between entry and exit time</th>",
+        "<th>False breakout (Yes/No)</th>",
+        "<th>P&amp;L at highest premium (gross / net, hypothetical)</th>",
+    ):
+        assert heading in options_panel
+    assert "simulated alternatives, not simultaneous trades" in options_panel
+    assert "counterfactual comparisons, not multiple open positions or orders" in options_panel
+    app_js = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert 't.false_breakout ? "Yes" : "No"' in app_js
+    loss_panel = re.search(r'<section class="panel" id="trade-loss-analysis-panel".*?</section>', html, re.S)
+    assert loss_panel is not None
+    for element_id in ("loss-date-from", "loss-date-to", "loss-instrument", "loss-option-type",
+                       "loss-exit-reason", "loss-min-amount", "loss-sort", "loss-export-csv"):
+        assert f'id="{element_id}"' in loss_panel.group(0)
+    assert "renderTradeLossAnalysis(result);" in app_js
+    assert '$("loss-export-csv").addEventListener("click", exportLossReportsCsv);' in app_js
+    assert 'async function obRestoreLatestRun()' in app_js
+    assert 'const runs = await api("/api/options-backtest/runs");' in app_js
+    assert 'obRestoreLatestRun();' in app_js
 
 
 # ---------- service ----------
@@ -663,6 +1355,45 @@ def test_service_rejects_today_and_future_end_dates_and_parallel_runs():
     with pytest.raises(RunRejected) as info:
         sticky.start(cfg())
     assert info.value.status_code == 409
+
+
+@pytest.mark.parametrize(
+    ("local_time", "accepted"),
+    [
+        (time(15, 29, 59), False),
+        (time(15, 30), True),
+        (time(15, 30, 1), True),
+    ],
+)
+def test_service_allows_today_only_at_or_after_market_close(local_time, accepted):
+    local_now = datetime.combine(date(2024, 1, 10), local_time).replace(
+        tzinfo=timezone(timedelta(hours=5, minutes=30))
+    )
+    service = OptionsBacktestService(
+        lambda: good_source(),
+        clock=lambda: local_now.astimezone(timezone.utc),
+        run_in_thread=False,
+    )
+    config = cfg(start_date=date(2024, 1, 10), end_date=date(2024, 1, 10))
+
+    if accepted:
+        run = service.start(config)
+        assert run["state"] == "completed"
+    else:
+        with pytest.raises(RunRejected, match="15:30 Asia/Kolkata"):
+            service.start(config)
+
+
+def test_service_never_allows_future_end_date_even_after_market_close():
+    local_now = datetime(2024, 1, 10, 15, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    service = OptionsBacktestService(
+        lambda: good_source(),
+        clock=lambda: local_now.astimezone(timezone.utc),
+        run_in_thread=False,
+    )
+
+    with pytest.raises(RunRejected, match="end_date cannot be in the future"):
+        service.start(cfg(start_date=date(2024, 1, 11), end_date=date(2024, 1, 11)))
 
 
 @pytest.mark.parametrize(
@@ -732,6 +1463,28 @@ def test_adapter_requests_exact_segments_symbols_and_returns_raw_rows():
     assert "segment=FNO" in fno_url and f"groww_symbol={CE}" in fno_url
     assert "candle_interval=5minute" in cash_url
     assert all("order" not in call[1] for call in transport.calls)
+
+
+def test_adapter_accepts_only_exact_listed_nifty_future_for_vwap():
+    manager, transport = _connected_manager([
+        (200, {"status": "SUCCESS", "payload": {"contracts": [FUT, CE]}}),
+        _payload([["2024-01-02T09:15:00", 22000, 22010, 21990, 22000, 1000, None]]),
+    ])
+    assert manager.historical_future_contract(EXPIRY.isoformat()) == FUT
+    rows = manager.historical_candles(
+        "FNO",
+        FUT,
+        datetime(2024, 1, 2, 9, 15),
+        datetime(2024, 1, 2, 15, 30),
+        "5minute",
+    )
+    assert rows[0].volume == 1000
+    assert f"groww_symbol={FUT}" in transport.calls[2][1]
+
+    invalid_manager, _ = _connected_manager([
+        (200, {"status": "SUCCESS", "payload": {"contracts": ["NSE-NIFTY-11Jan24-FUT"]}}),
+    ])
+    assert invalid_manager.historical_future_contract(EXPIRY.isoformat()) is None
 
 
 @pytest.mark.parametrize(
@@ -846,7 +1599,7 @@ def test_package_has_no_order_endpoints_or_ledger_access():
 
 # ---------- UI ----------
 
-def _ui_harness(post, get=None):
+def _ui_harness(post, get=None, runs="[]", submit=True):
     return f"""<script>
 const calls = [];
 window.fetch = async (path, options={{}}) => {{
@@ -854,6 +1607,7 @@ window.fetch = async (path, options={{}}) => {{
   calls.push({{url, method:options.method || "GET"}});
   let data = {{}}, status = 200;
   if (url === "/api/strategy/decisions" || url === "/api/trades" || url === "/api/replay") data = [];
+  else if (url === "/api/options-backtest/runs" && (options.method || "GET") === "GET") data = {runs};
   else if (url === "/api/options-backtest/runs" && options.method === "POST") {{ ({{data, status}} = {post}); }}
   else if (url.startsWith("/api/options-backtest/runs/")) data = {get or "{}"};
   return {{ok:status < 400,status,json:async()=>data}};
@@ -866,13 +1620,15 @@ window.fetch = async (path, options={{}}) => {{
   await sleep(50);
   const loadCalls = calls.filter(c => c.url.includes("options-backtest")).length;
   const panelHiddenInitially = document.getElementById("options-backtest-panel").hidden;
-  document.querySelector('[data-tab="backtest"]').click();
-  const form = document.getElementById("ob-form");
-  form.elements.start_date.value = "2024-01-02";
-  form.elements.end_date.value = "2024-01-02";
-  form.elements.lot_size.value = "25";
-  form.requestSubmit();
-  await sleep(2500);
+  if ({str(submit).lower()}) {{
+    document.querySelector('[data-tab="backtest"]').click();
+    const form = document.getElementById("ob-form");
+    form.elements.start_date.value = "2024-01-02";
+    form.elements.end_date.value = "2024-01-02";
+    form.elements.lot_size.value = "25";
+    form.requestSubmit();
+    await sleep(2500);
+  }}
   const snap = {{
     loadCalls, panelHiddenInitially,
     panelHidden: document.getElementById("options-backtest-panel").hidden,
@@ -880,6 +1636,9 @@ window.fetch = async (path, options={{}}) => {{
     state: document.getElementById("ob-status").dataset.state,
     message: document.getElementById("ob-message").textContent,
     trades: document.getElementById("ob-trades").innerText,
+    lossSummary: document.getElementById("loss-analysis-summary").innerText,
+    lossRows: document.getElementById("loss-report-rows").innerText,
+    lossFilterSummary: document.getElementById("loss-filter-summary").innerText,
     startDisabled: document.getElementById("ob-start").disabled,
     posts: calls.filter(c => c.method === "POST").map(c => c.url),
   }};
@@ -916,7 +1675,7 @@ def test_ui_distinguishes_zero_trades_from_failure_and_is_user_triggered(tmp_pat
         tmp_path,
         _ui_harness('{data:{run_id:"r1",state:"running",progress:{done:0,total:1}}, status:200}', _result("zero_trades")),
     )[0]
-    assert zero["loadCalls"] == 0 and zero["panelHiddenInitially"] is True and zero["panelHidden"] is False
+    assert zero["loadCalls"] == 1 and zero["panelHiddenInitially"] is True and zero["panelHidden"] is False
     assert zero["status"] == "Zero trades" and zero["state"] == "incomplete"
     assert "not a failure" in zero["message"] or zero["message"] == "Backtest finished."
     assert zero["posts"] == ["/api/options-backtest/runs"]
@@ -939,6 +1698,39 @@ def test_ui_reports_not_connected_and_failed_runs_not_as_zero_trades(tmp_path):
     )[0]
     assert failed["status"] == "Access denied" and failed["state"] == "failed"
     assert "not a zero-trade result" in failed["message"]
+
+
+@needs_browser
+def test_ui_restores_latest_completed_run_and_trade_loss_analysis(tmp_path):
+    result, _ = run_one(
+        DOWN_10_00,
+        {(PE, DAY): option_candles(overrides={"10:10": (100, 101, 70, 72)})},
+    )
+    result_dict = result.as_dict()
+    dashboard = build_loss_dashboard(result_dict["trades"], result_dict["loss_reports"])
+    restored = json.loads(_result("trades"))
+    restored["run_id"] = "restored-run"
+    restored["result"]["summary"]["trade_count"] = len(result_dict["trades"])
+    restored["result"]["trades"] = result_dict["trades"]
+    restored["result"]["sessions"] = [result_dict]
+    restored["result"]["loss_reports"] = result_dict["loss_reports"]
+    restored["result"]["loss_dashboard"] = dashboard
+    run_list = json.dumps([{"run_id": "restored-run", "state": "completed"}])
+    dashboard_page = _run_harness_page(
+        tmp_path,
+        _ui_harness(
+            '{data:{}, status:200}',
+            get=json.dumps(restored),
+            runs=run_list,
+            submit=False,
+        ),
+    )[0]
+
+    assert dashboard_page["loadCalls"] == 2
+    assert dashboard_page["status"] != "No run"
+    assert "NSE-NIFTY-04Jan24-21950-PE" in dashboard_page["lossRows"]
+    assert "1 report(s) shown; 1 losing trade(s)" in dashboard_page["lossFilterSummary"]
+    assert "1 / 1 completed trades" in dashboard_page["lossSummary"]
 
 def _ob_fetch(provider_env, segment, symbol, candle_rows):
     now = datetime(2025, 1, 3, 4, 0, tzinfo=timezone.utc)

@@ -2,14 +2,15 @@
 
 Defaults reuse the existing Yahoo ORB conventions where they exist (opening range
 09:15-10:15, entry cutoff 15:00, time exit 15:15, one trade per session, 5-minute
-candles). Stop-loss/target percentages, strike step, simulated capital and the cost
-model are *proposed defaults or user inputs* and are echoed in every result.
+candles). Stop-loss/target levels, ATR parameters, strike step, simulated capital
+and the cost model are proposed defaults or user inputs echoed in every result.
 """
 
+import math
 from datetime import date, datetime, time, timedelta
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SESSION_OPEN = time(9, 15)
 SESSION_CLOSE = time(15, 30)
@@ -65,11 +66,37 @@ class OptionsBacktestConfig(BaseModel):
     target_pct: float = Field(default=50, gt=0, le=1000, allow_inf_nan=False)
     stop_loss_points: float = Field(default=5, gt=0, le=100_000, allow_inf_nan=False)
     target_points: float = Field(default=5, gt=0, le=100_000, allow_inf_nan=False)
+    exit_strategy: Literal["none", "atr", "vwap", "trailing_stop"] = Field(
+        default="atr",
+        validation_alias=AliasChoices("exit_strategy", "exit_mode"),
+    )
+    atr_period: int = Field(default=14, ge=1, le=100)
+    atr_multiplier: float = Field(default=2, gt=0, le=20, allow_inf_nan=False)
+    trailing_stop_distance: float = Field(default=5, gt=0, le=100_000, allow_inf_nan=False)
+    trailing_stop_activation: float | None = Field(default=None, ge=0, le=100_000, allow_inf_nan=False)
+    initial_stop_loss: float | None = Field(default=None, gt=0, le=100_000, allow_inf_nan=False)
+    exit_on_session_end: bool = True
+    compare_vwap_and_trailing: bool = False
+    trailing_stop_comparison_distances: list[float] = Field(default_factory=list, max_length=20)
     max_trades_per_session: int = Field(default=1, ge=1, le=1000)
     lots: int = Field(default=1, ge=1, le=100)
     lot_size: int = Field(ge=1, le=10_000)
     initial_capital_inr: float = Field(default=100_000, gt=0, le=1e9, allow_inf_nan=False)
     costs: CostConfig = Field(default_factory=CostConfig)
+
+    @field_validator("exit_strategy", mode="before")
+    @classmethod
+    def normalize_exit_strategy(cls, value):
+        if isinstance(value, str):
+            return value.lower()
+        return value
+
+    @field_validator("trailing_stop_comparison_distances")
+    @classmethod
+    def validate_comparison_distances(cls, values):
+        if any(not math.isfinite(value) or value <= 0 for value in values):
+            raise ValueError("Trailing comparison distances must be finite values greater than zero.")
+        return values
 
     @model_validator(mode="after")
     def validate_rules(self):
@@ -98,6 +125,10 @@ class OptionsBacktestConfig(BaseModel):
             raise ValueError("entry_cutoff must be earlier than square_off_time.")
         if self.entry_cutoff < self.opening_range_end:
             raise ValueError("entry_cutoff must not be earlier than the end of the opening range.")
+        if self.compare_vwap_and_trailing and self.exit_strategy not in ("vwap", "trailing_stop"):
+            raise ValueError("Paired comparison requires exit_strategy to be vwap or trailing_stop.")
+        if self.trailing_stop_comparison_distances and not self.compare_vwap_and_trailing:
+            raise ValueError("Trailing comparison distances require compare_vwap_and_trailing.")
         return self
 
     @property
@@ -142,15 +173,67 @@ class OptionsBacktestConfig(BaseModel):
                 else f"Stop-loss: ₹{self.stop_loss_points:g} below entry premium; target: "
                 f"₹{self.target_points:g} above it."
             ),
-            "Exit evaluation uses option candles from the entry candle onward. Stop gaps fill at the "
-            "candle open when it is at/below the stop; a candle touching both stop and target exits "
-            "at the stop (conservative stop-first). Touching a level is assumed to fill, with no queue modelling.",
-            f"Time exit: open of the first option candle at/after {self.square_off_time:%H:%M}. If no such "
-            "candle exists the trade is reported as unresolved and excluded from P&L; no price is invented.",
+            (
+                f"Additional exit strategy: ATR trailing stop from option candles (period {self.atr_period}, "
+                f"multiplier {self.atr_multiplier:g}). It is the greater of the initial stop and the running "
+                "highest premium minus ATR × multiplier; Wilder ATR uses completed consecutive candles, "
+                "updates after each close, and the trail never moves down. Until ATR initializes, the initial "
+                "stop remains active."
+                if self.exit_strategy == "atr"
+                else (
+                    (
+                        "Additional exit strategy: NIFTY futures VWAP. For CE, exit after a completed futures "
+                        "candle closes below futures session VWAP; for PE, exit after a completed futures candle "
+                        "closes above it. The signal is acted on at the next option candle open. VWAP uses "
+                        "volume-weighted typical price (high + low + close) / 3 and requires complete futures "
+                        "candles with volume; the nearest listed future on or after the session is used, "
+                        "independent of option expiry. ORB entries continue to use NIFTY CASH index candles."
+                        if self.exit_strategy == "vwap"
+                        else (
+                            f"Peak-premium trailing stop: ₹{self.trailing_stop_distance:g} below the highest "
+                            "eligible option-candle high since entry"
+                            + (
+                                f", activated after a ₹{self.trailing_stop_activation:g} favourable move."
+                                if self.trailing_stop_activation is not None
+                                else ", active immediately."
+                            )
+                            + (
+                                f" Initial stop is ₹{self.initial_stop_loss:g} below entry."
+                                if self.initial_stop_loss is not None
+                                else " The selected stop-loss setting is the initial protective stop."
+                            )
+                            + " A new high updates the stop for the next candle only; entry-candle OHLC is "
+                            "ignored after the entry fill because intraminute order is unknown. Existing "
+                            "stop-first handling applies when an active stop and target are both touched."
+                            if self.exit_strategy == "trailing_stop"
+                            else "No additional trailing exit is enabled."
+                        )
+                    )
+                )
+            )
+            + " Exit at whichever comes first: target, initial stop, selected additional exit, or time exit. "
+            "Stop gaps fill at the candle open; if a candle touches both an active stop and target, "
+            "stop-first is assumed. Touching a level is assumed to fill, with no queue modelling.",
+            (
+                f"Time exit: open of the first option candle at/after {self.square_off_time:%H:%M}. If no such "
+                "candle exists the trade is reported as unresolved and excluded from P&L; no price is invented."
+                if self.exit_on_session_end
+                else "Session-end exit is disabled; positions without a simulated stop or target exit by the "
+                "available session data are unresolved and excluded from P&L (no overnight carry is modelled)."
+            ),
             f"At most {self.max_trades_per_session} trade(s) per session and one open position at a time; "
             "each distinct breakout event is considered only after the previous exit candle ends.",
             "P&L: gross = (exit premium - entry premium) x quantity; net = gross - modeled charges "
             "- modeled slippage. Costs not configured are reported as such.",
-            "Maximum premium reached is the highest option candle high from entry through the exit candle, "
-            "inclusive. Candle data does not establish the intrabar order of that high relative to an exit.",
+            "Highest premium between entry and exit is the entry fill or the highest high from fully "
+            "completed holding candles strictly after entry and before the exit candle. Ambiguous entry-candle "
+            "pre-fill and exit-candle highs are excluded because intrabar ordering is unknown.",
+            *(
+                [
+                    "Paired comparison holds entry, contract and quantity common across VWAP and the "
+                    f"trailing distances {sorted(set([self.trailing_stop_distance, *self.trailing_stop_comparison_distances]))}; "
+                    "the next signal is not admitted until every compared position exits."
+                ]
+                if self.compare_vwap_and_trailing else []
+            ),
         ]

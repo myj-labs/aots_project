@@ -720,11 +720,20 @@ function obBody(form) {
     candle_interval: f.get("candle_interval"),
     option_side_mode: f.get("option_side_mode"),
     exit_level_mode: f.get("exit_level_mode"),
+    exit_strategy: f.get("exit_strategy"),
     opening_range_minutes: num("opening_range_minutes"),
     entry_cutoff: t("entry_cutoff"), square_off_time: t("square_off_time"),
     strike_offset_steps: num("strike_offset_steps"), min_days_to_expiry: num("min_days_to_expiry"),
     stop_loss_pct: num("stop_loss_pct"), target_pct: num("target_pct"),
     stop_loss_points: num("stop_loss_points"), target_points: num("target_points"),
+    atr_period: num("atr_period"), atr_multiplier: num("atr_multiplier"),
+    trailing_stop_distance: num("trailing_stop_distance"),
+    trailing_stop_activation: f.get("trailing_stop_activation") === "" ? null : num("trailing_stop_activation"),
+    initial_stop_loss: f.get("initial_stop_loss") === "" ? null : num("initial_stop_loss"),
+    exit_on_session_end: f.get("exit_on_session_end") === "on",
+    compare_vwap_and_trailing: f.get("compare_vwap_and_trailing") === "on",
+    trailing_stop_comparison_distances: String(f.get("trailing_stop_comparison_distances") || "")
+      .split(",").map(value => value.trim()).filter(Boolean).map(Number),
     max_trades_per_session: num("max_trades_per_session"),
     lots: num("lots"), lot_size: num("lot_size"), initial_capital_inr: num("initial_capital_inr"),
     costs: {
@@ -739,6 +748,220 @@ function obSyncExitMode() {
   document.querySelectorAll("[data-ob-exit-mode]").forEach(label => {
     label.hidden = label.dataset.obExitMode !== mode;
   });
+}
+function obSyncTrailingExitStrategy() {
+  const strategy = $("ob-form").elements.exit_strategy.value;
+  document.querySelectorAll("[data-ob-exit-strategy]").forEach(label => {
+    label.hidden = label.dataset.obExitStrategy !== strategy;
+  });
+  $("ob-exit-strategy-help").textContent = strategy === "atr"
+    ? "The initial stop and target use the selected mode. ATR trailing uses option premiums, updates after each completed candle, and only ratchets upward; the initial stop remains active while ATR warms up."
+    : strategy === "vwap"
+      ? "The initial stop and target remain active. VWAP uses NIFTY futures volume-weighted typical prices; after a completed futures candle closes below futures VWAP for CE or above it for PE, the exit is at the next option candle open. ORB entries still use NIFTY CASH candles. VWAP mode requires complete futures candles with volume."
+      : strategy === "trailing_stop"
+        ? "The long CE/PE stop trails the highest eligible premium high by the configured ₹ distance. New highs update the stop for the next candle only; entry-candle high/low is ignored because intraminute order is unknown. An active stop gap fills at candle open. The initial stop, target, costs, and optional session-end exit remain active."
+        : "Only the configured initial stop, target, and time exit are active; ATR, VWAP, and peak-premium trailing exits are disabled.";
+  if ($("ob-form").elements.compare_vwap_and_trailing.checked) {
+    $("ob-exit-strategy-help").textContent +=
+      " Paired comparison requires VWAP or peak-premium trailing mode; it fixes a common non-overlapping entry set and tests the selected trailing distance plus any comma-separated extra distances.";
+  }
+}
+let lossAnalysisReports = [];
+let lossAnalysisDashboard = null;
+let selectedLossReportId = null;
+function lossCell(value) {
+  if (value === null || value === undefined || value === "") return "Unavailable";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+function lossPatternTable(title, groups) {
+  const rows = Object.entries(groups || {}).map(([name, stats]) =>
+    `<tr><td>${escapeHtml(name)}</td><td>${escapeHtml(stats.count)}</td><td>${escapeHtml(stats.sample_size)}</td><td>${escapeHtml(inr(stats.net_loss))}</td></tr>`
+  ).join("");
+  return `<h4>${escapeHtml(title)}</h4><div class="table-wrap"><table><thead><tr><th>Group</th><th>Losses</th><th>Sample size</th><th>Net loss</th></tr></thead><tbody>${rows || `<tr><td colspan="4">No losing trades</td></tr>`}</tbody></table></div>`;
+}
+function visibleLossReports() {
+  const from = $("loss-date-from").value;
+  const to = $("loss-date-to").value;
+  const instrument = $("loss-instrument").value.trim().toLowerCase();
+  const optionType = $("loss-option-type").value;
+  const exitReason = $("loss-exit-reason").value;
+  const minimumLoss = $("loss-min-amount").value === "" ? 0 : Number($("loss-min-amount").value);
+  const rows = lossAnalysisReports.filter(report => {
+    const item = report.summary;
+    return (!from || item.trading_date >= from)
+      && (!to || item.trading_date <= to)
+      && (!instrument || item.instrument.toLowerCase().includes(instrument))
+      && (!optionType || item.option_type === optionType)
+      && (!exitReason || item.exit_reason === exitReason)
+      && Math.abs(item.net_pnl) >= minimumLoss;
+  });
+  const sort = $("loss-sort").value;
+  rows.sort((left, right) => {
+    if (sort === "latest") {
+      return right.summary.entry_timestamp.localeCompare(left.summary.entry_timestamp);
+    }
+    if (sort === "date") {
+      return left.summary.entry_timestamp.localeCompare(right.summary.entry_timestamp);
+    }
+    return left.summary.net_pnl - right.summary.net_pnl;
+  });
+  return rows;
+}
+function lossJsonSection(title, value) {
+  return `<details><summary>${escapeHtml(title)}</summary><pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre></details>`;
+}
+function renderLossReportDetail(report) {
+  const panel = $("loss-report-detail");
+  if (!report) {
+    panel.hidden = true;
+    $("loss-report-detail-content").innerHTML = "";
+    return;
+  }
+  panel.hidden = false;
+  const summaryFields = [
+    ["Trade ID", report.summary.trade_id], ["Backtest run ID", report.summary.run_id],
+    ["Trading date", report.summary.trading_date], ["Instrument", report.summary.instrument],
+    ["Option type / strike / expiry", `${report.summary.option_type} / ${report.summary.strike} / ${report.summary.expiry}`],
+    ["Entry", `${obTime(report.summary.entry_timestamp)} @ ${inr(report.summary.entry_fill_price)}`],
+    ["Exit", `${obTime(report.summary.exit_timestamp)} @ ${inr(report.summary.exit_fill_price)}`],
+    ["Quantity / lot size", `${report.summary.quantity} / ${report.summary.lot_size} (${report.summary.lot_size_status})`],
+    ["Gross P&L / costs / net P&L", `${inr(report.summary.gross_pnl)} / ${inr(report.summary.costs.total_costs)} / ${inr(report.summary.net_pnl)}`],
+    ["Entry / exit strategy", `${report.summary.entry_strategy} / ${report.summary.exit_strategy} (${report.summary.exit_reason})`],
+    ["Holding duration", `${report.summary.holding_duration_minutes} minutes`],
+    ["MFE / MAE", `${lossCell(report.summary.maximum_favourable_excursion_premium_points)} / ${lossCell(report.summary.maximum_adverse_excursion_premium_points)} premium points`],
+    ["Best unrealized gross P&L / maximum giveback", `${inr(report.summary.best_unrealized_gross_pnl)} / ${inr(report.summary.maximum_profit_given_back_gross)}`],
+    ["Highest premium / timestamp", `${report.summary.peak_premium} @ ${obTime(report.summary.peak_timestamp)}`],
+    ["False breakout", report.summary.false_breakout ? `Yes @ ${obTime(report.summary.false_breakout_timestamp)}` : "No"]
+  ];
+  const rootRows = report.root_causes.map(finding =>
+    `<tr><td>${escapeHtml(finding.code)}</td><td>${escapeHtml(finding.confidence)}</td><td>${escapeHtml(finding.evidence)}</td></tr>`
+  ).join("");
+  const recommendationRows = report.recommendations.map(item =>
+    `<tr><td>${escapeHtml(item.test)}</td><td>${escapeHtml(item.tradeoff)}</td><td>${escapeHtml(item.area)}</td></tr>`
+  ).join("");
+  const timelineRows = report.timeline.map(item => obRow([
+    obTime(item.timestamp), item.event, item.open ?? "—", item.high ?? "—", item.low ?? "—", item.close ?? "—",
+    item.volume ?? "—", item.stop_price ?? "—", item.target_price ?? "—", item.fill_price ?? "—",
+    item.direction ?? "—", item.note ?? item.condition ?? item.event_type ?? "—"
+  ])).join("");
+  $("loss-report-detail-content").innerHTML =
+    `<h4>A. Trade summary</h4><div class="historical-result">${summaryFields.map(([name, value]) =>
+      `<div><span>${escapeHtml(name)}</span><strong>${escapeHtml(lossCell(value))}</strong></div>`
+    ).join("")}</div>`
+    + `<h4>B. Timeline reconstruction</h4><p class="muted">Provider timestamps are shown as supplied (timezone unspecified). Stop trigger precision is limited to the candle interval. No broker order was placed.</p><div class="table-wrap"><table><thead><tr><th>Time</th><th>Event</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th><th>Stop</th><th>Target</th><th>Fill</th><th>Direction</th><th>Details</th></tr></thead><tbody>${timelineRows}</tbody></table></div>`
+    + lossJsonSection("C. Entry quality analysis", report.entry_quality)
+    + lossJsonSection("D. Exit and stop-loss analysis", report.exit_analysis)
+    + lossJsonSection("E. Underlying-versus-option analysis", report.underlying_vs_option)
+    + lossJsonSection("F. Profit opportunity and giveback analysis", report.profit_opportunity)
+    + `<h4>G. Root-cause classifications</h4><div class="table-wrap"><table><thead><tr><th>Classification</th><th>Evidence assessment</th><th>Supporting observations</th></tr></thead><tbody>${rootRows}</tbody></table></div>`
+    + `<h4>H. Recommendations (tests only; no strategy changes applied)</h4><div class="table-wrap"><table><thead><tr><th>Suggested test</th><th>Trade-off</th><th>Area</th></tr></thead><tbody>${recommendationRows}</tbody></table></div>`
+    + lossJsonSection("Data sources and limitations", report.data_sources_and_limits);
+}
+function renderTradeLossAnalysis(result) {
+  const unique = new Map();
+  for (const report of result.loss_reports || []) {
+    if (report.generated_for_completed_loss && report.summary.net_pnl < 0) {
+      unique.set(report.report_id, report);
+    }
+  }
+  lossAnalysisReports = [...unique.values()];
+  lossAnalysisDashboard = result.loss_dashboard || null;
+  const reasons = [...new Set(lossAnalysisReports.map(report => report.summary.exit_reason))].sort();
+  const reasonSelect = $("loss-exit-reason");
+  const previousReason = reasonSelect.value;
+  reasonSelect.innerHTML = `<option value="">All</option>${reasons.map(reason =>
+    `<option value="${escapeHtml(reason)}">${escapeHtml(reason)}</option>`
+  ).join("")}`;
+  if (reasons.includes(previousReason)) reasonSelect.value = previousReason;
+
+  const dashboard = lossAnalysisDashboard || {};
+  $("loss-analysis-summary").innerHTML = [
+    ["Losing trades", `${dashboard.losing_trade_count ?? 0} / ${dashboard.sample_sizes?.all_completed_trades ?? 0} completed trades`],
+    ["Combined net loss", inr(dashboard.combined_net_loss ?? 0)],
+    ["Average / median loss", `${dashboard.average_loss === null ? "n/a" : inr(dashboard.average_loss)} / ${dashboard.median_loss === null ? "n/a" : inr(dashboard.median_loss)}`],
+    ["Largest loss", dashboard.largest_loss === null ? "n/a" : inr(dashboard.largest_loss)],
+    ["False breakouts", `${dashboard.false_breakout?.yes ?? 0} / ${dashboard.false_breakout?.sample_size ?? 0}`],
+    ["Profitable before losing", `${dashboard.profitable_before_loss?.count ?? 0} / ${dashboard.profitable_before_loss?.sample_size ?? 0}`],
+    ["Average gross giveback", dashboard.average_gross_profit_giveback === null ? "n/a" : inr(dashboard.average_gross_profit_giveback)]
+  ].map(([name, value]) =>
+    `<div><span>${escapeHtml(name)}</span><strong>${escapeHtml(value)}</strong></div>`
+  ).join("");
+  $("loss-pattern-summary").innerHTML = [
+    lossPatternTable("By month", dashboard.by_month),
+    lossPatternTable("By weekday", dashboard.by_weekday),
+    lossPatternTable("By entry hour", dashboard.by_entry_hour),
+    lossPatternTable("By option type", dashboard.by_option_type),
+    lossPatternTable("By expiry", dashboard.by_expiry),
+    lossPatternTable("By days to expiry", dashboard.by_days_to_expiry),
+    lossPatternTable("By exit reason", dashboard.by_exit_reason),
+    lossPatternTable("By exit strategy", dashboard.by_exit_strategy),
+    lossPatternTable("Root-cause finding counts", dashboard.root_causes),
+    lossPatternTable("Losers versus winners by side and exit strategy", dashboard.losses_vs_winners_by_side_and_exit)
+  ].join("") + `<p class="muted">${escapeHtml(dashboard.interpretation_note || "No recurring-pattern data yet.")}</p>`;
+  renderFilteredLossReports();
+}
+function renderFilteredLossReports() {
+  const rows = visibleLossReports();
+  $("loss-filter-summary").textContent =
+    `${rows.length} report(s) shown; ${lossAnalysisReports.length} losing trade(s) in this run. Select a row for full forensic details.`;
+  $("loss-report-rows").innerHTML = rows.length
+    ? rows.map(report => {
+      const item = report.summary;
+      return `<tr class="loss-report-row" data-report-id="${escapeHtml(report.report_id)}"><td>${escapeHtml(item.trading_date)}</td><td>${escapeHtml(item.instrument)}</td><td>${escapeHtml(item.option_type)}</td><td>${escapeHtml(obTime(item.entry_timestamp))}</td><td>${escapeHtml(obTime(item.exit_timestamp))}</td><td>${escapeHtml(item.exit_reason)}</td><td>${escapeHtml(inr(item.net_pnl))}</td><td>${escapeHtml(report.root_causes.map(finding => finding.code).join(", "))}</td></tr>`;
+    }).join("")
+    : `<tr><td colspan="8" class="muted">No completed losing trades match these filters.</td></tr>`;
+  $("loss-report-rows").querySelectorAll("[data-report-id]").forEach(row => {
+    row.addEventListener("click", () => {
+      selectedLossReportId = row.dataset.reportId;
+      renderLossReportDetail(lossAnalysisReports.find(report => report.report_id === selectedLossReportId));
+    });
+  });
+  const selected = rows.find(report => report.report_id === selectedLossReportId) || rows[0];
+  selectedLossReportId = selected?.report_id || null;
+  renderLossReportDetail(selected || null);
+  $("loss-export-csv").disabled = rows.length === 0;
+}
+function exportLossReportsCsv() {
+  const rows = visibleLossReports();
+  if (!rows.length) return;
+  const columns = [
+    "report_id", "run_id", "trade_id", "trading_date", "instrument", "option_type", "strike", "expiry",
+    "entry_timestamp", "entry_fill_price", "exit_timestamp", "exit_fill_price", "quantity", "lot_size",
+    "gross_pnl", "costs_total", "net_pnl", "exit_reason", "holding_duration_minutes",
+    "peak_premium", "peak_timestamp", "false_breakout", "root_causes_json", "recommendations_json",
+    "timeline_json", "entry_quality_json", "exit_analysis_json", "data_sources_json"
+  ];
+  const csvEscape = value => `"${String(value ?? "").replace(/"/g, '""')}"`;
+  const lines = [columns.map(csvEscape).join(",")];
+  for (const report of rows) {
+    const s = report.summary;
+    const data = {
+      report_id: report.report_id, run_id: report.run_id, trade_id: report.trade_id,
+      trading_date: s.trading_date, instrument: s.instrument, option_type: s.option_type,
+      strike: s.strike, expiry: s.expiry, entry_timestamp: s.entry_timestamp,
+      entry_fill_price: s.entry_fill_price, exit_timestamp: s.exit_timestamp,
+      exit_fill_price: s.exit_fill_price, quantity: s.quantity, lot_size: s.lot_size,
+      gross_pnl: s.gross_pnl, costs_total: s.costs.total_costs, net_pnl: s.net_pnl,
+      exit_reason: s.exit_reason, holding_duration_minutes: s.holding_duration_minutes,
+      peak_premium: s.peak_premium, peak_timestamp: s.peak_timestamp,
+      false_breakout: s.false_breakout,
+      root_causes_json: JSON.stringify(report.root_causes),
+      recommendations_json: JSON.stringify(report.recommendations),
+      timeline_json: JSON.stringify(report.timeline),
+      entry_quality_json: JSON.stringify(report.entry_quality),
+      exit_analysis_json: JSON.stringify(report.exit_analysis),
+      data_sources_json: JSON.stringify(report.data_sources_and_limits)
+    };
+    lines.push(columns.map(column => csvEscape(data[column])).join(","));
+  }
+  const blob = new Blob(["\uFEFF" + lines.join("\r\n")], {type:"text/csv;charset=utf-8"});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `aots-trade-loss-analysis-${lossAnalysisReports[0].run_id}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 function obRenderResult(run) {
   const result = run.result;
@@ -758,27 +981,75 @@ function obRenderResult(run) {
     ["Net P&L", inr(s.net_pnl)], ["Max drawdown", `${inr(s.max_drawdown_inr)} (${s.max_drawdown_pct}%)`],
     ["Profit factor", s.profit_factor === null ? "n/a" : String(s.profit_factor)],
     ["Avg net / trade", s.average_trade_pnl === null ? "n/a" : inr(s.average_trade_pnl)],
+    ["Avg profit / loss", `${s.average_profit === null ? "n/a" : inr(s.average_profit)} / ${s.average_loss === null ? "n/a" : inr(s.average_loss)}`],
+    ["Maximum consecutive losses", s.maximum_consecutive_losses],
+    ["Avg / max favourable excursion", s.average_favourable_excursion === null ? "n/a" : `${s.average_favourable_excursion} / ${s.maximum_favourable_excursion} premium points`],
+    ["Peak-profit giveback (avg / max)", s.average_profit_giveback_from_peak === null ? "n/a" : `${inr(s.average_profit_giveback_from_peak)} / ${inr(s.maximum_profit_giveback_from_peak)}`],
+    ["Exit reasons", Object.entries(s.exit_reason_breakdown || {}).map(([reason, count]) => `${reason}: ${count}`).join(", ") || "—"],
     ["Simulated equity", `${inr(s.initial_equity)} → ${inr(s.ending_equity)}`]
   ];
   $("ob-summary").hidden = false;
   $("ob-summary").innerHTML = cards.map(([k, v]) => `<div><span>${escapeHtml(k)}</span><strong>${escapeHtml(v)}</strong></div>`).join("");
+  const dailyRows = s.daily_pnl || [];
+  $("ob-daily-pnl-empty").hidden = dailyRows.length > 0;
+  $("ob-daily-pnl-rows").innerHTML = dailyRows.length
+    ? dailyRows.map(day => obRow([
+      day.session_date,
+      day.session_status,
+      day.trade_count,
+      day.winning_trades,
+      day.losing_trades,
+      day.win_rate_pct === null ? "N/A" : `${day.win_rate_pct}%`,
+      inr(day.gross_pnl),
+      inr(day.net_pnl)
+    ])).join("")
+    : `<tr><td colspan="8" class="muted">No session data</td></tr>`;
   const notes = [kinds[s.result_kind] || "", s.net_pnl_basis, s.profit_factor_note, s.max_drawdown_method];
   if(s.results_may_be_incomplete) notes.push("Some sessions or signals were excluded for data reasons; results may be biased or incomplete.");
   if(!s.costs_configured) notes.push("No costs configured: net P&L is not cost-modelled.");
   $("ob-notes").innerHTML = notes.filter(Boolean).map(n => `<p>${escapeHtml(n)}</p>`).join("");
+  const falseBreakouts = result.trades.filter(t => t.false_breakout);
+  $("ob-false-breakout-summary").textContent = result.trades.length
+    ? `${falseBreakouts.length} of ${result.trades.length} executed trade(s) had a NIFTY close back inside the opening range before or at the simulated exit.`
+    : "No executed trades to analyze.";
   $("ob-trades").innerHTML = result.trades.length ? result.trades.map(t => obRow([
     t.session_date, t.contract.groww_symbol, t.contract.option_type, t.contract.strike, t.contract.expiry,
     obTime(t.entry_time), t.entry_premium, obTime(t.exit_time), t.exit_premium,
-    `${t.max_premium_reached} @ ${obTime(t.max_premium_time)}`,
+    `${t.highest_premium_between_entry_and_exit} @ ${obTime(t.highest_premium_between_entry_and_exit_time)}`,
+    t.highest_premium_since_entry === null ? "—" : `${t.highest_premium_since_entry} @ ${obTime(t.highest_premium_time)}`,
+    t.trailing_stop_at_exit ?? "—",
+    t.maximum_favourable_excursion ?? "—", t.maximum_adverse_excursion ?? "—",
+    t.false_breakout ? "Yes" : "No", t.false_breakout_time ? obTime(t.false_breakout_time) : "—",
     `${t.lots}×${t.lot_size}=${t.quantity}`, inr(t.gross_pnl), inr(t.costs.charges_total), inr(t.costs.slippage), inr(t.net_pnl),
+    `${inr(t.hypothetical_peak_exit_gross_pnl)} / ${inr(t.hypothetical_peak_exit_net_pnl)}`,
     t.exit_reason, t.warnings.join(" | ")
-  ])).join("") : `<tr><td colspan="17" class="muted">No trades</td></tr>`;
+  ])).join("") : `<tr><td colspan="24" class="muted">No trades</td></tr>`;
+  const comparisons = result.comparison_trades || [];
+  const comparisonSummary = result.exit_comparison || {};
+  $("ob-exit-comparison").hidden = comparisons.length === 0;
+  $("ob-exit-comparison-summary").innerHTML = Object.entries(comparisonSummary).map(([name, stats]) =>
+    `<div><span>${escapeHtml(name)}</span><strong>Net ${escapeHtml(inr(stats.net_pnl))} · ${stats.trade_count} paired trade(s) · win ${stats.win_rate_pct ?? "n/a"}% · PF ${stats.profit_factor ?? "n/a"} · DD ${escapeHtml(inr(stats.maximum_drawdown_inr))} · avg/max MFE ${stats.average_favourable_excursion ?? "n/a"}/${stats.maximum_favourable_excursion ?? "n/a"} · max giveback ${escapeHtml(inr(stats.maximum_profit_giveback_from_peak ?? 0))}</strong></div>`
+  ).join("");
+  $("ob-exit-comparison-trades").innerHTML = comparisons.map(t => obRow([
+    t.comparison_variant, t.session_date, t.contract.groww_symbol, obTime(t.entry_time),
+    inr(t.entry_premium), obTime(t.exit_time), inr(t.exit_premium),
+    t.highest_premium_between_entry_and_exit === null
+      ? "—"
+      : `${t.highest_premium_between_entry_and_exit} @ ${obTime(t.highest_premium_between_entry_and_exit_time)}`,
+    t.false_breakout ? "Yes" : "No", t.false_breakout_time ? obTime(t.false_breakout_time) : "—",
+    t.exit_reason, inr(t.gross_pnl), inr(t.costs.total_costs), inr(t.net_pnl),
+    t.maximum_favourable_excursion ?? "—",
+    t.highest_premium_between_entry_and_exit === null
+      ? "—"
+      : inr(Math.max(0, (t.highest_premium_between_entry_and_exit - t.entry_premium) * t.quantity - t.gross_pnl))
+  ])).join("");
   $("ob-sessions").innerHTML = result.sessions.length ? result.sessions.map(x => {
     const skipped = result.skipped_signals.filter(k => k.session_date === x.session_date).map(k => `${k.reason}`);
     return obRow([x.session_date, x.status, [x.reason, ...x.warnings, ...skipped].filter(Boolean).join(" | "), x.signals.length, x.trades.length]);
   }).join("") : `<tr><td colspan="5" class="muted">No sessions</td></tr>`;
   $("ob-rules").innerHTML = [...result.rules, ...result.limitations, result.data_source.timestamp_note]
     .map(r => `<li>${escapeHtml(r)}</li>`).join("");
+  renderTradeLossAnalysis(result);
 }
 function obApply(run) {
   const running = run.state === "running";
@@ -810,15 +1081,50 @@ async function obPoll() {
     obStatus("Failed", "failed", `Could not read run status: ${err.message}`);
   }
 }
+async function obRestoreLatestRun() {
+  if(obRunId) return;
+  try {
+    const runs = await api("/api/options-backtest/runs");
+    const latest = runs.find(run => run.state === "running")
+      || runs.find(run => run.state === "completed" || run.state === "stopped");
+    if(!latest || obRunId) return;
+    obRunId = latest.run_id;
+    if(latest.state === "running") {
+      await obPoll();
+      return;
+    }
+    const run = await api(`/api/options-backtest/runs/${encodeURIComponent(obRunId)}`);
+    if(obRunId === latest.run_id) obApply(run);
+  } catch(err) {
+    obStatus("Restore unavailable", "incomplete", `Could not restore the latest backtest results: ${err.message}`);
+  }
+}
 $("ob-form").elements.exit_level_mode.addEventListener("change", obSyncExitMode);
 obSyncExitMode();
+$("ob-form").elements.exit_strategy.addEventListener("change", obSyncTrailingExitStrategy);
+$("ob-form").elements.compare_vwap_and_trailing.addEventListener("change", obSyncTrailingExitStrategy);
+obSyncTrailingExitStrategy();
 $("ob-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   clearTimeout(obTimer);
   $("ob-summary").hidden = true; $("ob-notes").textContent = "";
-  $("ob-trades").innerHTML = `<tr><td colspan="17" class="muted">No trades</td></tr>`;
+  $("ob-false-breakout-summary").textContent = "No backtest results yet.";
+  $("ob-daily-pnl-empty").hidden = false;
+  $("ob-daily-pnl-rows").innerHTML = `<tr><td colspan="8" class="muted">Run an options backtest to populate this report.</td></tr>`;
+  $("ob-trades").innerHTML = `<tr><td colspan="24" class="muted">No trades</td></tr>`;
   $("ob-sessions").innerHTML = `<tr><td colspan="5" class="muted">No sessions</td></tr>`;
   $("ob-rules").innerHTML = "";
+  lossAnalysisReports = [];
+  lossAnalysisDashboard = null;
+  selectedLossReportId = null;
+  ["loss-date-from", "loss-date-to", "loss-instrument", "loss-option-type", "loss-exit-reason", "loss-min-amount"]
+    .forEach(id => $(id).value = "");
+  $("loss-sort").value = "largest";
+  $("loss-analysis-summary").innerHTML = "";
+  $("loss-pattern-summary").textContent = "Run a backtest to analyze completed losing trades.";
+  $("loss-report-rows").innerHTML = `<tr><td colspan="8" class="muted">Run a backtest to populate reports.</td></tr>`;
+  $("loss-report-detail").hidden = true;
+  $("loss-export-csv").disabled = true;
   $("ob-start").disabled = true;
   obStatus("Starting", "running", "Starting backtest…");
   try {
@@ -838,6 +1144,13 @@ $("ob-stop").addEventListener("click", async () => {
   try { await api(`/api/options-backtest/runs/${encodeURIComponent(obRunId)}/stop`, {method:"POST"}); }
   catch(err) { obStatus("Failed", "failed", err.message); }
 });
+["loss-date-from", "loss-date-to", "loss-instrument", "loss-option-type", "loss-exit-reason", "loss-min-amount", "loss-sort"]
+  .forEach(id => $(id).addEventListener("input", renderFilteredLossReports));
+$("loss-exit-reason").addEventListener("change", renderFilteredLossReports);
+$("loss-option-type").addEventListener("change", renderFilteredLossReports);
+$("loss-sort").addEventListener("change", renderFilteredLossReports);
+$("loss-export-csv").addEventListener("click", exportLossReportsCsv);
+obRestoreLatestRun();
 
 // Groww historical response log (diagnostic).
 async function rlRefresh() {
