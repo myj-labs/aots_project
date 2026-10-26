@@ -826,7 +826,7 @@ window.fetch = async (path) => {{
 
 def _run_harness_page(tmp_path, harness):
     html_text = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    page = html_text.replace('<script src="/static/app.js"></script>', harness)
+    page = re.sub(r'<script src="/static/app\.js(?:\?[^"]*)?"></script>', harness, html_text)
     assert harness in page
     page_path = tmp_path / "dashboard-harness.html"
     page_path.write_text(page, encoding="utf-8")

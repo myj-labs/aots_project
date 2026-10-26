@@ -26,6 +26,8 @@
     <button type="button" class="app-tab" data-tab="paper" aria-pressed="true">Paper Trading</button>
     <button type="button" class="app-tab" data-tab="groww" aria-pressed="false">Groww</button>
     <button type="button" class="app-tab" data-tab="backtest" aria-pressed="false">Backtesting</button>
+    <button type="button" class="app-tab" data-tab="daily-pnl" aria-pressed="false">Day-wise P&amp;L</button>
+    <button type="button" class="app-tab" data-tab="loss-analysis" aria-pressed="false">Trade Loss Analysis</button>
     <button type="button" class="app-tab" data-tab="log" aria-pressed="false">Groww log</button>
   </nav>
   <section class="panel replay-panel" id="historical-replay" data-app-tab="paper">
@@ -202,7 +204,7 @@
     <form id="ob-form">
       <div class="form-row">
         <label>Start date<input name="start_date" type="date" required></label>
-        <label>End date (before today, max 31 days)<input name="end_date" type="date" required></label>
+        <label>End date (today allowed after 15:30 IST, max 31 days)<input name="end_date" type="date" required></label>
       </div>
       <div class="form-row">
         <label>Decision candle interval<select name="candle_interval"><option value="1minute">1 minute</option><option value="5minute" selected>5 minutes</option><option value="10minute">10 minutes</option></select></label>
@@ -219,6 +221,15 @@
         <label data-ob-exit-mode="percentage">Target (%)<input name="target_pct" type="number" min="0.01" max="1000" step="any" value="50"></label>
         <label data-ob-exit-mode="premium_points" hidden>Stop loss (₹ below entry)<input name="stop_loss_points" type="number" min="0.01" max="100000" step="any" value="5"></label>
         <label data-ob-exit-mode="premium_points" hidden>Sell trigger (₹ above entry)<input name="target_points" type="number" min="0.01" max="100000" step="any" value="5"></label>
+        <label>Additional exit strategy<select name="exit_strategy"><option value="none">None (SL/target/time only)</option><option value="atr" selected>ATR trailing stop</option><option value="vwap">NIFTY VWAP close</option><option value="trailing_stop">Peak-premium trailing stop</option></select></label>
+        <label data-ob-exit-strategy="atr">ATR period<input name="atr_period" type="number" min="1" max="100" step="1" value="14"></label>
+        <label data-ob-exit-strategy="atr">ATR multiplier<input name="atr_multiplier" type="number" min="0.01" max="20" step="any" value="2"></label>
+        <label data-ob-exit-strategy="trailing_stop" hidden>Trailing distance (₹)<input name="trailing_stop_distance" type="number" min="0.01" max="100000" step="any" value="5"></label>
+        <label data-ob-exit-strategy="trailing_stop" hidden>Activation move (₹, optional)<input name="trailing_stop_activation" type="number" min="0" max="100000" step="any" placeholder="Active immediately"></label>
+        <label data-ob-exit-strategy="trailing_stop" hidden>Initial stop distance (₹, optional)<input name="initial_stop_loss" type="number" min="0.01" max="100000" step="any" placeholder="Use stop/target setting"></label>
+        <label>Exit at session end<input name="exit_on_session_end" type="checkbox" checked></label>
+        <label>Paired VWAP/trailing comparison<input name="compare_vwap_and_trailing" type="checkbox"></label>
+        <label>Extra trailing distances (₹, comma-separated)<input name="trailing_stop_comparison_distances" type="text" placeholder="e.g. 3, 7.5, 10"></label>
         <label>Max trades/session<input name="max_trades_per_session" type="number" min="1" step="1" value="1"></label>
       </div>
       <div class="form-row">
@@ -234,17 +245,51 @@
         <label>GST (%)<input name="gst_pct" type="number" min="0" step="any" value="0"></label>
         <label>Slippage per unit per side (₹)<input name="slippage_per_unit_inr" type="number" min="0" step="any" value="0"></label>
       </div>
+      <p id="ob-exit-strategy-help" class="muted">The initial stop and target use the selected mode. ATR trailing is based on option premiums, updates after each completed candle, and only ratchets upward.</p>
       <button type="submit" id="ob-start">Run backtest</button>
       <button type="button" id="ob-stop" disabled>Stop</button>
     </form>
     <p id="ob-message" role="status" class="muted">No backtest has been started.</p>
     <div id="ob-summary" class="historical-result" hidden></div>
     <div id="ob-notes" class="muted"></div>
-    <div class="table-wrap"><table><thead><tr><th>Date</th><th>Contract</th><th>Type</th><th>Strike</th><th>Expiry</th><th>Entry</th><th>Entry ₹</th><th>Exit</th><th>Exit ₹</th><th>Max premium</th><th>Lots×size=qty</th><th>Gross</th><th>Charges</th><th>Slippage</th><th>Net</th><th>Exit reason</th><th>Warnings</th></tr></thead><tbody id="ob-trades"><tr><td colspan="17" class="muted">No trades</td></tr></tbody></table></div>
+    <section id="ob-false-breakout" class="panel" aria-live="polite"><h3>False-breakout analysis</h3><p class="muted">After a run, trades are marked when NIFTY closes back inside the opening range after entry and by the simulated exit time. This describes price action; it does not prove the breakout was false or predict future performance.</p><p id="ob-false-breakout-summary" class="muted">No backtest results yet.</p></section>
+    <section id="ob-exit-comparison" class="panel" hidden><h3>Paired exit comparison — simulated alternatives, not simultaneous trades</h3><p class="muted">Each row replays the same ORB entry, contract, and quantity under a different exit rule. Matching entry times are intentional and are counterfactual comparisons, not multiple open positions or orders. The regular Trades table above shows the selected primary strategy. The next shared entry is considered only after the latest exit among all comparison variants.</p><div id="ob-exit-comparison-summary" class="historical-result"></div><div class="table-wrap"><table><thead><tr><th>Exit scenario (not a separate entry)</th><th>Date</th><th>Contract</th><th>Entry Time</th><th>Entry Price</th><th>Exit Time</th><th>Exit Price</th><th>Highest premium between entry and exit time</th><th>False breakout (Yes/No)</th><th>False breakout time</th><th>Exit reason</th><th>Gross P&amp;L</th><th>Costs</th><th>Net P&amp;L</th><th>MFE points</th><th>Peak giveback</th></tr></thead><tbody id="ob-exit-comparison-trades"></tbody></table></div></section>
+    <div class="table-wrap"><table><thead><tr><th>Date</th><th>Contract</th><th>Type</th><th>Strike</th><th>Expiry</th><th>Entry Time</th><th>Entry Price</th><th>Exit Time</th><th>Exit Price</th><th>Highest premium between entry and exit time</th><th>Trailing peak</th><th>Trail at exit ₹</th><th>MFE ₹</th><th>MAE ₹</th><th>False breakout (Yes/No)</th><th>False breakout time</th><th>Lots×size=qty</th><th>Gross P&amp;L</th><th>Charges</th><th>Slippage</th><th>Actual net P&amp;L</th><th>P&amp;L at highest premium (gross / net, hypothetical)</th><th>Exit reason</th><th>Warnings</th></tr></thead><tbody id="ob-trades"><tr><td colspan="24" class="muted">No trades</td></tr></tbody></table></div>
     <h3>Session diagnostics</h3>
     <div class="table-wrap"><table><thead><tr><th>Date</th><th>Status</th><th>Reason / warnings</th><th>Signals</th><th>Trades</th></tr></thead><tbody id="ob-sessions"><tr><td colspan="5" class="muted">No sessions</td></tr></tbody></table></div>
     <h3>Rules and limitations</h3>
     <ul id="ob-rules" class="muted"></ul>
+  </section>
+  <section class="panel" id="options-backtest-daily-pnl" data-app-tab="daily-pnl" hidden>
+    <div class="panel-heading">
+      <div><h2>Day-wise options backtest P&amp;L</h2>
+        <p class="muted">Daily metrics use the selected primary exit strategy’s executed trades. Paired comparison alternatives are excluded. Win rate is winning trades divided by executed trades; days without trades show N/A.</p></div>
+    </div>
+    <p id="ob-daily-pnl-empty" class="muted">Run an options backtest to see daily results here.</p>
+    <div class="table-wrap"><table><thead><tr><th>Date</th><th>Session status</th><th>Total trades</th><th>Wins</th><th>Losses</th><th>Win rate</th><th>Gross P&amp;L</th><th>Net P&amp;L</th></tr></thead><tbody id="ob-daily-pnl-rows"></tbody></table></div>
+  </section>
+  <section class="panel" id="trade-loss-analysis-panel" data-app-tab="loss-analysis" hidden>
+    <div class="panel-heading">
+      <div><h2>Trade Loss Analysis</h2>
+        <p class="muted">Evidence-based reports are generated only for completed trades with negative realized net P&amp;L. Reports and candle timelines belong to the latest displayed in-memory backtest run.</p></div>
+      <div><button type="button" id="loss-export-csv" disabled>Export filtered reports CSV</button></div>
+    </div>
+    <div id="loss-analysis-summary" class="historical-result"></div>
+    <h3>Recurring patterns (descriptive; sample sizes shown)</h3>
+    <div id="loss-pattern-summary" class="muted">Run a backtest to analyze completed losing trades.</div>
+    <h3>Filter losing trades</h3>
+    <div class="form-row" id="loss-filters">
+      <label>From date<input id="loss-date-from" type="date"></label>
+      <label>To date<input id="loss-date-to" type="date"></label>
+      <label>Instrument contains<input id="loss-instrument" type="search" placeholder="NSE-NIFTY"></label>
+      <label>Option type<select id="loss-option-type"><option value="">All</option><option value="CE">CE</option><option value="PE">PE</option></select></label>
+      <label>Exit reason<select id="loss-exit-reason"><option value="">All</option></select></label>
+      <label>Minimum loss (₹)<input id="loss-min-amount" type="number" min="0" step="any" placeholder="Any"></label>
+      <label>Sort by<select id="loss-sort"><option value="largest">Largest loss</option><option value="latest">Latest trade</option><option value="date">Date ascending</option></select></label>
+    </div>
+    <div id="loss-filter-summary" class="muted">No backtest results yet.</div>
+    <div class="table-wrap"><table><thead><tr><th>Date</th><th>Instrument</th><th>Side</th><th>Entry</th><th>Exit</th><th>Exit reason</th><th>Net loss</th><th>Root-cause findings</th></tr></thead><tbody id="loss-report-rows"><tr><td colspan="8" class="muted">Run a backtest to populate reports.</td></tr></tbody></table></div>
+    <section id="loss-report-detail" class="panel" hidden><h3>Forensic report</h3><div id="loss-report-detail-content"></div></section>
   </section>
   <section class="panel" id="strategy-demo" data-app-tab="paper">
     <div class="panel-heading">
@@ -298,6 +343,6 @@
   </section>
   <footer>Prototype for engineering validation, not investment advice. Verify official SEBI, exchange and broker requirements before live deployment.</footer>
 </main>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=backtest-date-cutoff-1"></script>
 </body>
 </html>

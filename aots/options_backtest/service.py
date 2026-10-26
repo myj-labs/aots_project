@@ -10,16 +10,18 @@ import threading
 import time as _time
 import uuid
 from collections import OrderedDict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from ..brokers.base import HistoricalCandle
 from ..provider_session import ProviderRequestError
 from .config import OptionsBacktestConfig
 from .data import (
     OptionContract,
     contract_symbol,
     describe_listing,
+    format_expiry_token,
     parse_contract_symbol,
     select_contract,
     validate_session_candles,
@@ -31,6 +33,7 @@ from .engine import (
     run_session,
     summarize,
 )
+from .forensics import build_loss_dashboard
 
 IST = ZoneInfo("Asia/Kolkata")
 MAX_RUNS_KEPT = 10
@@ -63,6 +66,7 @@ class GrowwOptionResolver:
         self._expiries: dict[tuple[int, int], list[date]] = {}
         self._contracts: dict[date, list[str]] = {}
         self._candles: dict[tuple[str, date], Any] = {}
+        self._future_symbols: dict[date, str | None] = {}
 
     def _pause(self) -> None:
         if self._pace:
@@ -83,6 +87,60 @@ class GrowwOptionResolver:
             f"NIFTY index candles {session_date.isoformat()}",
             self._source.historical_candles, "CASH", _UNDERLYING_SYMBOL, start, end, self._config.candle_interval,
         )
+
+    def _listed_future(self, expiry: date) -> str | None:
+        if expiry not in self._future_symbols:
+            try:
+                symbol = self._fetch(
+                    f"future contract for expiry {expiry.isoformat()}",
+                    self._source.historical_future_contract,
+                    expiry.isoformat(),
+                )
+            except ProviderRequestError as exc:
+                if exc.status_code != 422:
+                    raise
+                symbol = None
+            expected_symbol = f"NSE-NIFTY-{format_expiry_token(expiry)}-FUT"
+            if symbol is not None and symbol != expected_symbol:
+                raise OptionUnavailable(
+                    "future_contract_invalid",
+                    f"Groww returned a future identifier that did not exactly match expiry "
+                    f"{expiry.isoformat()}; VWAP could not be calculated.",
+                )
+            self._future_symbols[expiry] = symbol
+        return self._future_symbols[expiry]
+
+    def vwap_future(self, session_date: date) -> tuple[str | None, list[HistoricalCandle]]:
+        """Fetch the nearest listed NIFTY future on/after the session for volume-based VWAP."""
+        earliest = session_date
+        year, month = session_date.year, session_date.month
+        candidates: set[date] = set()
+        for _ in range(2):
+            try:
+                candidates.update(
+                    expiry for expiry in self._month_expiries(year, month) if expiry >= earliest
+                )
+            except ProviderRequestError as exc:
+                if exc.status_code != 422:
+                    raise
+            year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+
+        for expiry in sorted(candidates):
+            symbol = self._listed_future(expiry)
+            if symbol is None:
+                continue
+            start = datetime.combine(session_date, datetime.min.time()).replace(hour=9, minute=15)
+            rows = self._fetch(
+                f"future candles {symbol} {session_date.isoformat()}",
+                self._source.historical_candles,
+                "FNO",
+                symbol,
+                start,
+                start.replace(hour=15, minute=30),
+                self._config.candle_interval,
+            )
+            return symbol, rows
+        return None, []
 
     def _month_expiries(self, year: int, month: int) -> list[date]:
         key = (year, month)
@@ -198,11 +256,13 @@ def execute_backtest(
     on_progress: Callable[[int, int, date], None] = lambda done, total, day: None,
     sleep: Callable[[float], None] = _time.sleep,
     pace_seconds: float = 0.0,
+    run_id: str = "direct",
 ) -> dict[str, Any]:
     """Run all sessions sequentially. Provider errors propagate and fail the whole run."""
     resolver = GrowwOptionResolver(source, config, sleep, pace_seconds)
     dates = weekdays(config.start_date, config.end_date)
     equity = config.initial_capital_inr
+    comparison_equities: dict[str, float] = {}
     sessions: list[dict[str, Any]] = []
     stopped = False
     for index, day in enumerate(dates):
@@ -211,13 +271,41 @@ def execute_backtest(
             break
         on_progress(index, len(dates), day)
         rows = resolver.underlying(day)
-        session = run_session(day, rows, config, resolver, equity)
+        vwap_symbol, vwap_rows = (
+            resolver.vwap_future(day)
+            if config.exit_strategy == "vwap" or config.compare_vwap_and_trailing
+            else (None, None)
+        )
+        session = run_session(
+            day,
+            rows,
+            config,
+            resolver,
+            equity,
+            vwap_rows=vwap_rows,
+            vwap_symbol=vwap_symbol,
+            comparison_equities=comparison_equities,
+            run_id=run_id,
+        )
         entry = session.as_dict()
         equity += sum(t["net_pnl"] for t in entry["trades"])
         sessions.append(entry)
     on_progress(len(sessions), len(dates), config.end_date)
     summary = summarize(sessions, config, dates)
     summary["stopped_early"] = stopped
+    loss_reports = [report for session in sessions for report in session.get("loss_reports", [])]
+    all_trades = [trade for session in sessions for trade in session["trades"]]
+    loss_dashboard = build_loss_dashboard(all_trades, loss_reports)
+    summary["loss_dashboard"] = loss_dashboard
+    comparison_trades = [
+        trade for session in sessions for trade in session.get("comparison_trades", [])
+    ]
+    comparison = _summarize_exit_comparison(
+        comparison_trades,
+        config.initial_capital_inr,
+    ) if config.compare_vwap_and_trailing else {}
+    if comparison:
+        summary["exit_comparison"] = comparison
     skipped = [
         {"session_date": s["session_date"], **sig}
         for s in sessions
@@ -226,7 +314,11 @@ def execute_backtest(
     ]
     return {
         "summary": summary,
-        "trades": [t for s in sessions for t in s["trades"]],
+        "trades": all_trades,
+        "loss_reports": loss_reports,
+        "loss_dashboard": loss_dashboard,
+        "comparison_trades": comparison_trades,
+        "exit_comparison": comparison,
         "sessions": sessions,
         "skipped_signals": skipped,
         "config": config.model_dump(mode="json"),
@@ -235,6 +327,13 @@ def execute_backtest(
             "provider": "Groww (read-only historical API)",
             "underlying_symbol": _UNDERLYING_SYMBOL,
             "underlying_segment": "CASH",
+            "vwap_underlying_symbol": (
+                "NIFTY futures contract for selected expiry"
+                if config.exit_strategy == "vwap" or config.compare_vwap_and_trailing else None
+            ),
+            "vwap_underlying_segment": (
+                "FNO" if config.exit_strategy == "vwap" or config.compare_vwap_and_trailing else None
+            ),
             "option_segment": "FNO",
             "candle_interval": config.candle_interval,
             "timestamp_note": TIMESTAMP_NOTE,
@@ -246,8 +345,83 @@ def execute_backtest(
             "Weekdays without candles are excluded as no_data; they may be exchange holidays.",
             "Excluded or incomplete sessions can bias results.",
             "Candle timestamp semantics (start vs end) are assumed to be candle-start and are unverified.",
+            *(
+                [
+                    "Paired exit comparison uses one shared entry set; each next signal is considered only "
+                    "after all compared positions have exited. This can reduce trade count versus standalone "
+                    "runs and is not a full-dataset parameter optimization."
+                ]
+                if config.compare_vwap_and_trailing else []
+            ),
         ],
     }
+
+
+def _summarize_exit_comparison(
+    trades: list[dict[str, Any]],
+    initial_capital: float,
+) -> dict[str, dict[str, Any]]:
+    """Summarize paired exits whose entry schedule was held common by the session engine."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        grouped.setdefault(trade["comparison_variant"], []).append(trade)
+    summaries: dict[str, dict[str, Any]] = {}
+    for variant, rows in grouped.items():
+        rows.sort(key=lambda trade: (trade["session_date"], trade["entry_time"]))
+        nets = [float(trade["net_pnl"]) for trade in rows]
+        wins = [pnl for pnl in nets if pnl > 0]
+        losses = [pnl for pnl in nets if pnl < 0]
+        equity = initial_capital
+        peak = equity
+        max_drawdown = 0.0
+        current_losses = 0
+        max_consecutive_losses = 0
+        exit_reasons: dict[str, int] = {}
+        for trade, pnl in zip(rows, nets):
+            equity += pnl
+            peak = max(peak, equity)
+            max_drawdown = max(max_drawdown, peak - equity)
+            current_losses = current_losses + 1 if pnl < 0 else 0
+            max_consecutive_losses = max(max_consecutive_losses, current_losses)
+            reason = trade["exit_reason"]
+            exit_reasons[reason] = exit_reasons.get(reason, 0) + 1
+        favourable = [
+            float(trade["maximum_favourable_excursion"])
+            for trade in rows
+            if trade.get("maximum_favourable_excursion") is not None
+        ]
+        giveback = [
+            max(
+                0.0,
+                (
+                    float(trade["highest_premium_since_entry"])
+                    - float(trade["entry_premium"])
+                ) * int(trade["quantity"]) - float(trade["gross_pnl"]),
+            )
+            for trade in rows
+            if trade.get("highest_premium_since_entry") is not None
+        ]
+        summaries[variant] = {
+            "trade_count": len(rows),
+            "gross_pnl": round(sum(float(trade["gross_pnl"]) for trade in rows), 2),
+            "net_pnl": round(sum(nets), 2),
+            "win_rate_pct": round(len(wins) / len(rows) * 100, 2) if rows else None,
+            "profit_factor": round(sum(wins) / abs(sum(losses)), 4) if losses else None,
+            "maximum_drawdown_inr": round(max_drawdown, 2),
+            "average_profit": round(sum(wins) / len(wins), 2) if wins else None,
+            "average_loss": round(sum(losses) / len(losses), 2) if losses else None,
+            "maximum_consecutive_losses": max_consecutive_losses,
+            "average_favourable_excursion": (
+                round(sum(favourable) / len(favourable), 4) if favourable else None
+            ),
+            "maximum_favourable_excursion": round(max(favourable), 4) if favourable else None,
+            "average_profit_giveback_from_peak": (
+                round(sum(giveback) / len(giveback), 2) if giveback else None
+            ),
+            "maximum_profit_giveback_from_peak": round(max(giveback), 2) if giveback else None,
+            "exit_reason_breakdown": exit_reasons,
+        }
+    return summaries
 
 
 class OptionsBacktestService:
@@ -265,9 +439,14 @@ class OptionsBacktestService:
         self._threads: dict[str, threading.Thread] = {}
 
     def start(self, config: OptionsBacktestConfig) -> dict[str, Any]:
-        today = self._clock().astimezone(IST).date()
-        if config.end_date >= today:
-            raise RunRejected("end_date must be before today (Asia/Kolkata); only completed sessions can be backtested.")
+        now_ist = self._clock().astimezone(IST)
+        today = now_ist.date()
+        session_close = datetime.combine(today, time(15, 30), tzinfo=IST)
+        if config.end_date > today or (config.end_date == today and now_ist < session_close):
+            raise RunRejected(
+                "end_date cannot be in the future; today's date is allowed only at or after "
+                "15:30 Asia/Kolkata so the session can complete."
+            )
         source = self._get_source()
         with self._lock:
             if any(r["state"] == "running" for r in self._runs.values()):
@@ -308,7 +487,15 @@ class OptionsBacktestService:
                 self._runs[run_id]["progress"] = {"done": done, "total": total, "current_date": day.isoformat()}
 
         try:
-            result = execute_backtest(source, config, should_stop=stop.is_set, on_progress=progress, sleep=self._sleep, pace_seconds=self._pace)
+            result = execute_backtest(
+                source,
+                config,
+                should_stop=stop.is_set,
+                on_progress=progress,
+                sleep=self._sleep,
+                pace_seconds=self._pace,
+                run_id=run_id,
+            )
             state, error = ("stopped" if result["summary"]["stopped_early"] else "completed"), None
         except ProviderRequestError as exc:
             result, state = None, "failed"
