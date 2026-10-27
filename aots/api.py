@@ -17,13 +17,14 @@ from .models import (
     StrategyEvaluationRequest,
 )
 from .paper import PaperBroker
-from .brokers.response_log import HISTORICAL_RESPONSE_LOG
+from .brokers.response_log import HISTORICAL_RESPONSE_LOG, LIVE_FEED_DIAGNOSTICS
 from .provider_session import (
     ProviderConnectRequest,
     ProviderRequestError,
     ProviderSessionManager,
 )
 from .risk import RiskEngine, RiskRejected
+from .live_paper import LivePaperService, LivePaperStartRequest
 from .strategy_service import StrategyService
 from .backtest.data import BacktestConfig
 from .options_backtest.config import OptionsBacktestConfig
@@ -44,17 +45,24 @@ STATIC_DIR = Path(__file__).parent / "static"
 provider_session = ProviderSessionManager()
 replay_service = ReplayService()
 options_backtest_service = OptionsBacktestService(lambda: provider_session)
+live_paper_service = LivePaperService(
+    settings, db, risk, paper, provider_session
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global replay_service, options_backtest_service
+    global replay_service, options_backtest_service, live_paper_service
     replay_service = ReplayService()
     options_backtest_service = OptionsBacktestService(lambda: provider_session)
+    live_paper_service = LivePaperService(
+        settings, db, risk, paper, provider_session
+    )
     db.event("APP_STARTED", {"mode": settings.trading_mode, "broker": settings.broker})
     yield
     replay_service.shutdown()
     options_backtest_service.shutdown()
+    live_paper_service.shutdown()
     provider_session.shutdown()
     db.event("APP_STOPPED", {})
 
@@ -80,8 +88,64 @@ def provider_status():
     return provider_session.status()
 
 
+@app.get("/api/live-paper/status")
+def live_paper_status():
+    return live_paper_service.status()
+
+
+@app.post("/api/live-paper/start")
+def start_live_paper(req: LivePaperStartRequest):
+    if not provider_session.status().get("connected"):
+        raise HTTPException(
+            status_code=409,
+            detail="Connect Groww on the Groww tab before starting live paper.",
+        )
+    try:
+        return live_paper_service.start(req)
+    except ProviderRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/live-paper/resume")
+def resume_live_paper():
+    if not provider_session.status().get("connected"):
+        raise HTTPException(
+            status_code=409,
+            detail="Reconnect Groww on the Groww tab before recovering the open paper position.",
+        )
+    try:
+        return live_paper_service.resume()
+    except ProviderRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/live-paper/stop")
+def stop_live_paper():
+    return live_paper_service.stop()
+
+
+@app.get("/api/live-paper/events")
+def live_paper_events():
+    return [
+        event for event in db.events(100)
+        if event["event_type"].startswith("LIVE_PAPER_")
+    ][:50]
+
+
 @app.post("/api/provider/connect")
 def provider_connect(req: ProviderConnectRequest):
+    if live_paper_service.status()["status"] in {
+        "RUNNING", "STARTING", "RUNNING_POSITION_RECOVERY",
+        "STOPPING_POSITION_OPEN", "SESSION_END_EXIT_PENDING",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop live paper and reconcile any open paper position before reconnecting Groww.",
+        )
     try:
         return provider_session.connect(req)
     except ProviderRequestError as exc:
@@ -90,6 +154,7 @@ def provider_connect(req: ProviderConnectRequest):
 
 @app.post("/api/provider/disconnect")
 def provider_disconnect():
+    live_paper_service.shutdown()
     return provider_session.disconnect()
 
 
@@ -158,6 +223,21 @@ def provider_response_log():
 @app.post("/api/provider/response-log/clear")
 def provider_response_log_clear():
     HISTORICAL_RESPONSE_LOG.clear()
+    return {"cleared": True}
+
+
+@app.get("/api/live-paper/diagnostics")
+def live_paper_diagnostics():
+    return {
+        "capacity": LIVE_FEED_DIAGNOSTICS.capacity,
+        "scope": "Redacted Live Paper ORB and Groww market-feed lifecycle diagnostics; in memory, newest first.",
+        "entries": LIVE_FEED_DIAGNOSTICS.snapshot(),
+    }
+
+
+@app.post("/api/live-paper/diagnostics/clear")
+def clear_live_paper_diagnostics():
+    LIVE_FEED_DIAGNOSTICS.clear()
     return {"cleared": True}
 
 

@@ -41,6 +41,8 @@ def test_dashboard_loads():
     assert "AOTS" in r.text
     assert "PAPER MODE" in r.text
     assert "Paper Trading" in r.text
+    assert "Live Paper ORB" in r.text
+    assert 'id="live-paper-panel" data-app-tab="live-paper"' in r.text
     assert "Historical Simulation capability check" in r.text
     assert "Groww account insights" in r.text
     for label in (
@@ -66,6 +68,46 @@ def test_dashboard_loads():
     assert "/api/provider/historical/expiries" in script.text
     assert "/api/provider/historical/contracts" in script.text
     assert "/api/provider/historical/candles/check" in script.text
+    live_script = client.get("/static/live_paper.js")
+    assert live_script.status_code == 200
+    assert "/api/live-paper/start" in live_script.text
+    assert "/api/live-paper/resume" in live_script.text
+    assert "Live feed diagnostics" in r.text
+    assert "/api/live-paper/diagnostics" in script.text
+
+
+def test_live_paper_api_requires_connected_groww(paper_api):
+    client, *_ = paper_api
+
+    assert client.get("/api/live-paper/status").json()["status"] == "STOPPED"
+    response = client.post(
+        "/api/live-paper/start",
+        json={
+            "expiry_date": "2025-01-09",
+            "opening_range_minutes": 15,
+            "candle_interval_minutes": 5,
+            "lot_size": 25,
+        },
+    )
+
+    assert response.status_code == 409
+    assert "Connect Groww" in response.json()["detail"]
+
+
+def test_live_paper_diagnostic_api_returns_and_clears_redacted_entries(paper_api):
+    client, *_ = paper_api
+    from aots.brokers.response_log import LIVE_FEED_DIAGNOSTICS
+
+    LIVE_FEED_DIAGNOSTICS.clear()
+    LIVE_FEED_DIAGNOSTICS.record(
+        "groww_feed", "nats_connect", "failed", details={"exception": "socket unavailable"}
+    )
+
+    response = client.get("/api/live-paper/diagnostics")
+    assert response.status_code == 200
+    assert response.json()["entries"][0]["stage"] == "nats_connect"
+    assert client.post("/api/live-paper/diagnostics/clear").json() == {"cleared": True}
+    assert client.get("/api/live-paper/diagnostics").json()["entries"] == []
 
 
 def test_mark_endpoint_requires_observation_sequence():

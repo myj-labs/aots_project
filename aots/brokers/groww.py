@@ -248,6 +248,7 @@ class GrowwRuntimeConnection:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._token: str | None = None
         self._expires_at: datetime | None = None
+        self._live_feed = None
 
     def __repr__(self) -> str:
         return f"GrowwRuntimeConnection(auth_method={self.auth_method!r})"
@@ -303,11 +304,37 @@ class GrowwRuntimeConnection:
         return self._expires_at is not None and self._clock() >= self._expires_at
 
     def close(self) -> None:
-        if self._credentials is not None:
-            self._credentials.clear()
-        self._credentials = None
-        self._token = None
-        self._expires_at = None
+        live_feed = self._live_feed
+        self._live_feed = None
+        try:
+            if live_feed is not None:
+                live_feed.stop()
+        finally:
+            if self._credentials is not None:
+                self._credentials.clear()
+            self._credentials = None
+            self._token = None
+            self._expires_at = None
+
+    def create_market_feed(self, on_tick, on_error):
+        """Create a read-only market feed without exposing the access token."""
+        if self._token is None or self.expired():
+            raise ProviderAuthError("Groww access token is unavailable or expired; reconnect.")
+        if self._live_feed is not None:
+            if self._live_feed.is_running:
+                if not self._live_feed.stop_requested:
+                    raise ProviderRejectedError("A Groww market feed is already active.")
+            self._live_feed.stop()
+            self._live_feed = None
+        from .groww_feed import GrowwMarketFeed
+
+        self._live_feed = GrowwMarketFeed(
+            self._token,
+            on_tick,
+            on_error,
+            transport=self._transport,
+        )
+        return self._live_feed
 
     def _send(self, method, url, headers, body=None, auth=False, log=None):
         try:

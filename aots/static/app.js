@@ -1172,9 +1172,41 @@ async function rlRefresh() {
     box.textContent = err.message;
   }
 }
+async function lfdRefresh() {
+  const box = $("lfd-entries");
+  try {
+    const data = await api("/api/live-paper/diagnostics");
+    $("lfd-status").textContent = `${data.entries.length} diagnostic(s)`;
+    if(!data.entries.length) {
+      box.textContent = "No live-feed diagnostics recorded yet. Start Live Paper ORB to capture startup stages.";
+      return;
+    }
+    box.innerHTML = data.entries.map(entry => {
+      const summary = `#${entry.id} · ${entry.timestamp} · ${entry.component} · ${entry.stage} · ${entry.outcome}`;
+      return `<details><summary>${escapeHtml(summary)}</summary>`
+        + `<pre>${escapeHtml(JSON.stringify(entry.details, null, 2))}</pre></details>`;
+    }).join("");
+  } catch(err) {
+    $("lfd-status").textContent = "Failed";
+    box.textContent = err.message;
+  }
+}
 $("rl-refresh").addEventListener("click", rlRefresh);
 $("rl-clear").addEventListener("click", async () => {
   await api("/api/provider/response-log/clear", {method: "POST"}).catch(() => null);
   rlRefresh();
 });
-document.querySelectorAll('.app-tab[data-tab="log"]').forEach(b => b.addEventListener("click", rlRefresh));
+$("lfd-refresh").addEventListener("click", lfdRefresh);
+$("lfd-clear").addEventListener("click", async () => {
+  try {
+    await api("/api/live-paper/diagnostics/clear", {method: "POST"});
+    await lfdRefresh();
+  } catch(err) {
+    $("lfd-status").textContent = "Failed";
+    $("lfd-entries").textContent = err.message;
+  }
+});
+document.querySelectorAll('.app-tab[data-tab="log"]').forEach(b => b.addEventListener("click", () => {
+  void rlRefresh();
+  void lfdRefresh();
+}));
