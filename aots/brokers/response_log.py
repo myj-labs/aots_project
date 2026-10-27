@@ -6,6 +6,7 @@ and the log is never persisted.
 """
 
 import threading
+import re
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any
@@ -19,6 +20,20 @@ _MAX_STRING = 300
 _MAX_KEYS = 40
 _SENSITIVE_KEYS = ("token", "secret", "key", "authorization", "checksum", "totp", "password")
 LOGGED_PATH_PREFIX = "/v1/historical/"
+DIAGNOSTIC_CAPACITY = 200
+_DIAGNOSTIC_SECRET_PATTERNS = (
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)\b(token|secret|password|authorization|socketkey|signature|api[_-]?key)\b\s*[:=]\s*['\"]?[^\s,'\";}]+"),
+    re.compile(r"(?i)([?&](?:access_token|token|api_key|secret|signature)=)[^&\s]+"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+)
+
+
+def _safe_diagnostic_text(value: str) -> str:
+    text = value[:1000]
+    for pattern in _DIAGNOSTIC_SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    return text[:300]
 
 
 def sanitize(value: Any, depth: int = 0) -> Any:
@@ -102,3 +117,62 @@ class ResponseLog:
 
 
 HISTORICAL_RESPONSE_LOG = ResponseLog()
+
+
+class LiveFeedDiagnosticLog:
+    """Bounded, in-memory, redacted lifecycle diagnostics for the live feed."""
+
+    def __init__(self, capacity: int = DIAGNOSTIC_CAPACITY):
+        self._entries: deque[dict[str, Any]] = deque(maxlen=capacity)
+        self._lock = threading.Lock()
+        self._next_id = 1
+        self.capacity = capacity
+
+    def record(
+        self,
+        component: str,
+        stage: str,
+        outcome: str,
+        *,
+        details: dict[str, Any] | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        safe_details: dict[str, Any] = {}
+        for key, value in (details or {}).items():
+            if isinstance(value, str):
+                safe_details[str(key)] = _safe_diagnostic_text(value)
+            elif value is None or isinstance(value, (bool, int, float)):
+                safe_details[str(key)] = value
+            else:
+                safe_details[str(key)] = f"[{type(value).__name__}]"
+        if error is not None:
+            safe_details["exception_type"] = type(error).__name__
+            message = str(error)
+            if message:
+                safe_details["exception"] = _safe_diagnostic_text(message)
+            errno = getattr(error, "errno", None)
+            if isinstance(errno, int):
+                safe_details["errno"] = errno
+        with self._lock:
+            self._entries.append(
+                {
+                    "id": self._next_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "component": _safe_diagnostic_text(component),
+                    "stage": _safe_diagnostic_text(stage),
+                    "outcome": _safe_diagnostic_text(outcome),
+                    "details": safe_details,
+                }
+            )
+            self._next_id += 1
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(reversed(self._entries))
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+LIVE_FEED_DIAGNOSTICS = LiveFeedDiagnosticLog()

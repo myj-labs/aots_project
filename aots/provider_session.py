@@ -86,6 +86,9 @@ class ProviderConnection(MarketDataProvider, AccountInsightsProvider, Protocol):
     ) -> list:
         """Return read-only historical candles for the NIFTY index or an option."""
 
+    def create_market_feed(self, on_tick, on_error):
+        """Create a managed read-only live market-data feed."""
+
 
 ConnectionFactory = Callable[[str, Mapping[str, str]], ProviderConnection]
 
@@ -296,6 +299,18 @@ class ProviderSessionManager:
             )
         except ValueError as exc:
             raise ProviderRequestError(str(exc), 422)
+        except ProviderError as exc:
+            self._on_provider_error(exc)
+
+    def start_market_feed(self, on_tick, on_error):
+        """Return a provider-owned feed handle; the caller starts/stops the handle."""
+        connection = self._active_connection()
+        try:
+            return connection.create_market_feed(on_tick, on_error)
+        except AttributeError:
+            raise ProviderRequestError(
+                "The connected provider does not support live market data.", 409
+            ) from None
         except ProviderError as exc:
             self._on_provider_error(exc)
 

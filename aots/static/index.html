@@ -20,16 +20,64 @@
 </header>
 <main>
   <section class="warning">
-    <strong>Paper trading only.</strong> Simulated orders never reach Groww. Marks are entered manually; there is no live market-data feed or source observation timestamp, so mark freshness is unavailable. The local kill switch blocks new paper entries; it does not cancel broker orders or square off a real account.
+    <strong>Paper trading only.</strong> Simulated orders never reach Groww. The separate Live Paper ORB tab can consume Groww market data after explicit operator action; all entries and exits remain local simulations. For manual marks, mark freshness is unavailable because no verified market-data source timestamp is supplied. The local kill switch blocks new paper entries; it does not cancel broker orders or square off a real account.
   </section>
   <nav class="app-tabs" aria-label="Application sections">
     <button type="button" class="app-tab" data-tab="paper" aria-pressed="true">Paper Trading</button>
+    <button type="button" class="app-tab" data-tab="live-paper" aria-pressed="false">Live Paper ORB</button>
     <button type="button" class="app-tab" data-tab="groww" aria-pressed="false">Groww</button>
     <button type="button" class="app-tab" data-tab="backtest" aria-pressed="false">Backtesting</button>
     <button type="button" class="app-tab" data-tab="daily-pnl" aria-pressed="false">Day-wise P&amp;L</button>
     <button type="button" class="app-tab" data-tab="loss-analysis" aria-pressed="false">Trade Loss Analysis</button>
     <button type="button" class="app-tab" data-tab="log" aria-pressed="false">Groww log</button>
   </nav>
+  <section class="panel" id="live-paper-panel" data-app-tab="live-paper" hidden>
+    <div class="panel-heading">
+      <div>
+        <h2>Groww-fed NIFTY ORB · paper only</h2>
+        <p class="muted">Uses live Groww NIFTY/index and option premiums to evaluate the existing close-based ORB rule. Fills use the first eligible post-signal option LTP; stops, targets, and risk checks use the local paper ledger. No Groww order API is used.</p>
+      </div>
+      <span id="live-paper-status" class="pill">STOPPED</span>
+    </div>
+    <form id="live-paper-form">
+      <div class="form-row">
+        <label>Option expiry date<input name="expiry_date" type="date" required></label>
+        <label>Opening range (minutes)<input name="opening_range_minutes" type="number" min="15" max="60" step="1" value="60" required></label>
+        <label>Index candle interval<select name="candle_interval_minutes"><option value="1">1 minute</option><option value="5" selected>5 minutes</option><option value="10">10 minutes</option></select></label>
+        <label>Option side<select name="option_side_mode"><option value="both" selected>CE and PE</option><option value="ce_only">CE only</option><option value="pe_only">PE only</option></select></label>
+      </div>
+      <div class="form-row">
+        <label>Entry cutoff (Asia/Kolkata)<input name="entry_cutoff" type="time" value="15:00" required></label>
+        <label>Square-off time (Asia/Kolkata)<input name="square_off_time" type="time" value="15:15" required></label>
+        <label>Strike step<input name="strike_step" type="number" min="1" max="1000" step="1" value="50" required></label>
+        <label>Strike offset steps<input name="strike_offset_steps" type="number" min="0" max="5" step="1" value="0" required></label>
+      </div>
+      <div class="form-row">
+        <label>Lots<input name="lots" type="number" min="1" max="10" step="1" value="1" required></label>
+        <label>Lot size (you supply; verify current contract size)<input name="lot_size" type="number" min="1" max="10000" step="1" required></label>
+        <label>Initial stop distance (₹)<input name="stop_loss_points" type="number" min="0.01" step="any" value="5" required></label>
+        <label>Take-profit distance (₹, optional)<input name="take_profit_points" type="number" min="0.01" step="any" placeholder="No target"></label>
+      </div>
+      <label>Maximum entries this calendar date<input name="max_trades_per_session" type="number" min="1" max="20" step="1" value="1" required></label>
+      <div class="replay-actions">
+        <button type="submit" id="live-paper-start">Start live paper</button>
+        <button type="button" id="live-paper-resume" disabled>Recover open paper position</button>
+        <button type="button" id="live-paper-stop" class="danger" disabled>Stop new entries</button>
+        <span id="live-paper-message" role="status" class="muted">Connect Groww in the Groww tab before starting.</span>
+      </div>
+    </form>
+    <div class="cards replay-metrics">
+      <article class="metric"><span>Session date (Asia/Kolkata)</span><strong id="live-paper-date">—</strong></article>
+      <article class="metric"><span>Last NIFTY index LTP</span><strong id="live-paper-index">—</strong><small id="live-paper-index-time">No feed observation yet</small></article>
+      <article class="metric"><span>Completed index candles</span><strong id="live-paper-candles">0</strong></article>
+      <article class="metric"><span>Opening range high / low</span><strong id="live-paper-range">—</strong><small id="live-paper-range-error"></small></article>
+      <article class="metric"><span>Entries today</span><strong id="live-paper-count">0</strong></article>
+      <article class="metric"><span>Open simulated position</span><strong id="live-paper-position">None</strong><small id="live-paper-position-pnl"></small></article>
+    </div>
+    <h3>Live paper events</h3>
+    <ol id="live-paper-events" class="replay-event-list"><li class="muted">No live-paper events.</li></ol>
+    <p class="muted">Safety and data limitations: Groww LTP observations are not bid/ask execution prices; no spread, brokerage, or slippage is added by the existing paper broker. Entry/exit timestamps and the risk snapshot are recorded locally. Opening-range candles require complete tick-built intervals; missing intervals are not synthesized. Calendar-date handling uses Asia/Kolkata, not an exchange holiday calendar.</p>
+  </section>
   <section class="panel replay-panel" id="historical-replay" data-app-tab="paper">
     <div class="panel-heading">
       <div>
@@ -194,6 +242,12 @@
       <span id="rl-status" class="pill">Not loaded</span></div>
     <div class="actions"><button type="button" id="rl-refresh">Refresh</button> <button type="button" id="rl-clear">Clear log</button></div>
     <div id="rl-entries" class="muted">No responses loaded.</div>
+    <hr>
+    <div class="panel-heading"><div><h2>Live feed diagnostics</h2>
+      <p class="muted">Bounded, in-memory startup and connection diagnostics. Error messages are redacted; credentials and raw provider response bodies are not recorded.</p></div>
+      <span id="lfd-status" class="pill">Not loaded</span></div>
+    <div class="actions"><button type="button" id="lfd-refresh">Refresh diagnostics</button> <button type="button" id="lfd-clear">Clear diagnostics</button></div>
+    <div id="lfd-entries" class="muted">No live-feed diagnostics loaded.</div>
   </section>
   <section class="panel" id="options-backtest-panel" data-app-tab="backtest" hidden>
     <div class="panel-heading">
@@ -344,5 +398,6 @@
   <footer>Prototype for engineering validation, not investment advice. Verify official SEBI, exchange and broker requirements before live deployment.</footer>
 </main>
 <script src="/static/app.js?v=backtest-date-cutoff-1"></script>
+<script src="/static/live_paper.js"></script>
 </body>
 </html>

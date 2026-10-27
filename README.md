@@ -16,6 +16,7 @@ A runnable starter for a NIFTY-options trading system with a FastAPI web dashboa
 - Asia/Kolkata calendar-date risk rollover (not an exchange holiday calendar)
 - Pluggable strategy protocol plus an opt-in supplied-input spot-threshold demonstration
 - Groww API boundary documented separately; no live order methods implemented
+- Opt-in Groww-fed NIFTY ORB paper session in a separate dashboard tab
 - Automated tests
 
 ## Requirements
@@ -48,6 +49,14 @@ Open http://127.0.0.1:8000. Run tests with `pytest`.
 
 The dashboard starts in paper mode with an empty ledger. The Paper Trading and Groww sections are separate; historical-data requests occur only after an explicit user action and remain separate from simulated capital and the paper ledger. Use the API docs at `/docs` to inspect endpoints. The sample trade endpoint creates a **simulated** paper trade for testing; it does not submit any broker order.
 
+### Live Paper ORB tab
+
+The separate **Live Paper ORB** tab is an explicit, local-only paper session. Connect Groww first, choose an option expiry and strategy parameters, then start the session. AOTS subscribes to the NIFTY index feed, builds only tick-observed candles, applies the existing close-based opening-range breakout rule, resolves the selected NIFTY option from Groww's option chain and instrument master, and fills a local paper position at the first fresh option LTP received after the signal. It uses the existing `PaperBroker` and `RiskEngine`; stops, optional total-position profit targets, session square-off, and the risk gate do not call any broker order API.
+
+The feed uses Groww's socket token and NATS WebSocket only for read-only market data. Socket credentials are kept in memory; the SDK helper that writes fixed `a.creds`/`b.creds` files is not used. The instrument master is downloaded only after starting the live-paper feature, with a bounded response size and timeout. Automated tests use fake feeds and do not call Groww. If the application restarts with an open live paper position, it requires an explicit Groww reconnect and recovery action; recovery monitors that position but does not resume new entries.
+
+This is not a production execution simulator. LTP is not bid/ask, and the existing paper broker does not model spread, slippage, brokerage, or exchange charges. Tick-built candles cannot reconstruct a candle interval with no observations; missing bars are not synthesized. Session rollover is an Asia/Kolkata calendar date, not an exchange holiday/trading-session calendar. See [Groww integration](docs/GROWW_INTEGRATION.md) for operating limits.
+
 ## API quick reference
 
 - `GET /api/status` — app mode, risk state, counts
@@ -61,6 +70,11 @@ The dashboard starts in paper mode with an empty ledger. The Paper Trading and G
 - `POST /api/strategy/evaluate` — evaluate supplied inputs without persisting or trading
 - `POST /api/strategy/process` — persist a decision and risk-gate an explicit simulated entry
 - `GET /api/strategy/decisions` — inspect recent persisted strategy outcomes
+- `GET /api/live-paper/status` — inspect the explicit live-paper ORB session
+- `POST /api/live-paper/start` — start a Groww-fed local paper session
+- `POST /api/live-paper/stop` — disable new entries; an open paper position stays monitored
+- `POST /api/live-paper/resume` — recover monitoring of a persisted open paper position
+- `GET /api/live-paper/events` — inspect live-paper session events
 - `GET /health` — health check
 
 ### Deterministic strategy demonstration
